@@ -2,9 +2,31 @@
 
 A local Rust gateway that lets OpenAI clients use a ChatGPT account with Codex access. It draws on Zed's [`openai_subscribed.rs`](https://github.com/zed-industries/zed/blob/7279c76ef71d45504d7cfea00ee054f852ca0fbf/crates/openai_subscribed/src/openai_subscribed.rs), [`responses.rs`](https://github.com/zed-industries/zed/blob/7279c76ef71d45504d7cfea00ee054f852ca0fbf/crates/open_ai/src/responses.rs), and [`completion.rs`](https://github.com/zed-industries/zed/blob/7279c76ef71d45504d7cfea00ee054f852ca0fbf/crates/open_ai/src/completion.rs).
 
-To install and manage the service with `brew services`, see the [Homebrew guide](homebrew/README.md).
+## Getting started with Homebrew (macOS)
 
-## Getting started (macOS and Linux, Rust 1.89+)
+From the repository root, build and test the local formula. Run `brew tap-new` only once.
+
+```sh
+brew tap-new --no-git local/codex-ai
+
+tap_dir="$(brew --repository local/codex-ai)"
+cp homebrew/Formula/codex-ai.rb "$tap_dir/Formula/"
+tar -czf "$tap_dir/codex-ai-0.1.0.tar.gz" Cargo.toml Cargo.lock src
+brew trust --formula local/codex-ai/codex-ai
+brew install --build-from-source local/codex-ai/codex-ai
+brew test local/codex-ai/codex-ai
+```
+
+`brew trust` approves only this formula. Skip that line if your Homebrew version does not have the command. `brew test` checks the launcher and its environment file in a temporary directory, without a ChatGPT account.
+
+1. Run `codex-ai-service --help` to create `~/.config/cosex_ai/env` with `0600` permissions.
+2. Generate a local key with `openssl rand -hex 32` and set `CODEX_API_KEY` in that file. You can also set `CODEX_LISTEN` (default: `127.0.0.1:8787`) or `CODEX_DEBUG=1`.
+3. Stop any existing `codex_ai serve` process, then run `codex-ai-service login`. Open the displayed URL in a browser **on the same machine** and complete sign-in.
+4. Run `brew services start local/codex-ai/codex-ai` **without `sudo`** to start the service and have it restart at login. To run in the foreground instead, use `codex-ai-service serve`.
+
+See the [Homebrew guide](homebrew/README.md) for upgrades, restarts, and logs.
+
+## Getting started with Cargo (macOS and Linux, Rust 1.89+)
 
 ```sh
 cargo run --locked -- login
@@ -17,7 +39,19 @@ export CODEX_API_KEY="$(openssl rand -hex 32)"
 cargo run --locked -- serve
 ```
 
-Configure your OpenAI client with the **base URL `http://127.0.0.1:8787/v1`** and the **local `CODEX_API_KEY`**. This key is neither an OpenAI API key nor an OAuth token. To list the models available to your account, run this from a shell with the same key:
+## Calling the API
+
+Configure your OpenAI client with the **base URL `http://127.0.0.1:8787/v1`** and the **local `CODEX_API_KEY`**. This key is neither an OpenAI API key nor an OAuth token.
+
+The `curl` examples require the same key in the shell that runs them. If you installed via Homebrew and trust the contents of your environment file, you can load it in a POSIX shell:
+
+```sh
+set -a
+. "$HOME/.config/cosex_ai/env"
+set +a
+```
+
+To list the models available to your account:
 
 ```sh
 curl -fsS http://127.0.0.1:8787/v1/models \
@@ -42,6 +76,8 @@ curl -fsS http://127.0.0.1:8787/v1/responses \
 | `POST /v1/chat/completions` | Returns text, `function` tool calls, and usage as JSON or SSE. For images and other tool types, use Responses. |
 
 The gateway does not retain conversation state: it sends `store: false`. Include the relevant history in `input` or `messages` on each turn. The gateway does not support `previous_response_id`, `background` mode, or embeddings, and it does not implement the full public OpenAI API. Available models, parameters, and quotas depend on your Codex access. The ChatGPT backend used here is not the public API at `api.openai.com` and may change.
+
+Leading `system` messages are sent to Codex as a leading `developer` message so their text can be part of the cached prefix. An explicit Responses `instructions` field is forwarded separately. For stateful tool workflows over the stateless gateway, prefer Responses and replay any opaque reasoning items alongside tool calls and results.
 
 ### Testing a Chat Completions tool call
 
@@ -73,6 +109,6 @@ No telemetry is sent externally. Debug mode does not log full URLs, headers, key
 - Access and refresh tokens are stored in an unencrypted local `tokens.json` file (`0600` permissions, in a private directory with `0700` permissions). The cache location is chosen in this order: `CODEX_CACHE_DIR` (an absolute path), `$XDG_CACHE_HOME/codex_ai`, then `~/.cache/codex_ai`. Do not put the cache directory in a repository or shared folder.
 - The server reuses the access token, refreshes it as it nears expiry or after a `401` from Codex, and replaces the cache atomically. Only one process can use the cache at a time. If the session is revoked, stop the server and run `login` again.
 - `CODEX_LISTEN` lets you change the port or loopback address (for example, `127.0.0.1:8080`). Do not expose the server to the network: anyone with the local key can use your account's quota.
-- To clear the local cache, stop the server and run `cargo run --locked -- logout`. This does not revoke the session with OpenAI.
+- To clear the local cache, stop the server and run `codex-ai-service logout` (Homebrew) or `cargo run --locked -- logout` (Cargo). This does not revoke the session with OpenAI.
 
 `cargo test --locked` checks the cache and HTTP formats against a mock backend. No ChatGPT account is required.
