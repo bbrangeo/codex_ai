@@ -1,6 +1,7 @@
 class CodexAi < Formula
   desc "Codex AI service"
-  url "file://#{File.expand_path("../codex-ai-0.1.0.tar.gz", __dir__)}"
+  url "file://#{File.expand_path("../codex-ai-0.1.1.tar.gz", __dir__)}"
+  license "MIT"
 
   depends_on "rust" => :build
 

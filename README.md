@@ -11,7 +11,7 @@ brew tap-new --no-git local/codex-ai
 
 tap_dir="$(brew --repository local/codex-ai)"
 cp homebrew/Formula/codex-ai.rb "$tap_dir/Formula/"
-tar -czf "$tap_dir/codex-ai-0.1.0.tar.gz" Cargo.toml Cargo.lock src
+tar -czf "$tap_dir/codex-ai-0.1.1.tar.gz" Cargo.toml Cargo.lock LICENSE src
 brew trust --formula local/codex-ai/codex-ai
 brew install --build-from-source local/codex-ai/codex-ai
 brew test local/codex-ai/codex-ai
@@ -125,3 +125,13 @@ No telemetry is sent externally. Request logs do not include full URLs, headers,
 - To clear the local cache, stop the server and run `codex-ai-service logout` (Homebrew) or `cargo run --locked -- logout` (Cargo). This does not revoke the session with OpenAI.
 
 `cargo test --locked` checks the cache and HTTP formats against a mock backend. No ChatGPT account is required.
+
+## Publishing a release
+
+Update the version in `Cargo.toml` and refresh `Cargo.lock` with `cargo update --workspace`. After a push to the default branch, GitHub Actions builds and tests both platforms. If the matching `v<version>` tag does not exist, it tags the tested commit and publishes the macOS Apple Silicon and Windows x86-64 archives to [GitHub Releases](https://github.com/bbrangeo/codex_ai/releases). The workflow then publishes the crate to crates.io if the tag points to that tested commit and the crate version is not already published. Existing tags and releases are left unchanged.
+
+To enable crates.io publishing for the first time:
+
+1. Use a new version rather than moving `v0.1.0`, which predates the publish metadata and the [MIT license](LICENSE).
+2. After the new version passes CI and is tagged, publish from that tagged commit with `cargo publish --locked --registry crates-io`, using a crates.io API token locally. Until this first upload, CI skips crates.io publication with a warning.
+3. In the crate's Settings → Trusted Publishing, add GitHub owner `bbrangeo`, repository `codex_ai`, and workflow filename `build.yml`. Leave the environment field blank. Future versions use a short-lived token; no GitHub secret is needed.

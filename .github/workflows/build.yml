@@ -1,6 +1,6 @@
 name: Build macOS and Windows
 
-on: [push, pull_request, workflow_dispatch]
+on: [workflow_dispatch]
 
 permissions:
   contents: read
@@ -34,3 +34,114 @@ jobs:
           name: ${{ matrix.artifact }}
           path: target/release/${{ matrix.binary }}
           if-no-files-found: error
+
+  release:
+    needs: build
+    if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    permissions:
+      contents: write
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Check for a new version
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(cargo metadata --format-version 1 --no-deps --locked |
+            jq -er '.packages[] | select(.name == "codex_ai") | .version')
+          tag="v$version"
+          refs=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$tag" --jq '.[].ref')
+          if grep -Fxq "refs/tags/$tag" <<< "$refs"; then
+            echo "Tag $tag already exists; skipping GitHub release."
+            tagged_sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/tags/$tag" --jq '.sha')
+            if [[ "$tagged_sha" != "$GITHUB_SHA" ]]; then
+              echo "Skipping crates.io publication: $tag points to a different commit."
+              exit 0
+            fi
+          else
+            echo "new_tag=$tag" >> "$GITHUB_OUTPUT"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v4
+        if: steps.version.outputs.new_tag != ''
+        with:
+          pattern: codex_ai-*
+          path: dist
+      - name: Publish GitHub release
+        if: steps.version.outputs.new_tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.version.outputs.new_tag }}
+        run: |
+          chmod 0755 dist/codex_ai-macos/codex_ai
+          cp LICENSE dist/codex_ai-macos/
+          tar -czf dist/codex_ai-macos-arm64.tar.gz -C dist/codex_ai-macos codex_ai LICENSE
+          zip -j dist/codex_ai-windows-x86_64.zip dist/codex_ai-windows/codex_ai.exe LICENSE
+          gh release create "$RELEASE_TAG" \
+            dist/codex_ai-macos-arm64.tar.gz dist/codex_ai-windows-x86_64.zip \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "codex_ai $RELEASE_TAG" --generate-notes
+
+  publish-crate:
+    needs: release
+    if: needs.release.outputs.version != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: crates-io-${{ needs.release.outputs.version }}
+      cancel-in-progress: false
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Check crates.io version
+        id: crates-io
+        env:
+          CRATE_VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          index="$RUNNER_TEMP/codex_ai.index"
+          status=$(curl --silent --show-error --retry 3 --max-time 20 \
+            --output "$index" --write-out '%{http_code}' https://index.crates.io/co/de/codex_ai)
+          case "$status" in
+            200) ;;
+            404)
+              echo '::warning::Skipping crates.io: publish codex_ai manually once and configure Trusted Publishing (see README).'
+              exit 0 ;;
+            *)
+              echo "::error::crates.io index returned HTTP $status."
+              exit 1 ;;
+          esac
+          published=$(jq -rs --arg version "$CRATE_VERSION" 'any(.[]; .vers == $version)' "$index")
+          if [[ "$published" == true ]]; then
+            echo "codex_ai $CRATE_VERSION is already on crates.io."
+          else
+            echo 'publish=true' >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@v6
+        if: steps.crates-io.outputs.publish == 'true'
+        with:
+          persist-credentials: false
+      - name: Authenticate to crates.io
+        if: steps.crates-io.outputs.publish == 'true'
+        id: auth
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca80c54cd9 # v1.0.6
+      - name: Publish to crates.io
+        if: steps.crates-io.outputs.publish == 'true'
+        run: cargo publish --locked --registry crates-io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

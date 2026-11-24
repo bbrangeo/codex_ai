@@ -1,6 +1,9 @@
 [package]
 name = "codex_ai"
-version = "0.1.0"
+version = "0.1.1"
+description = "A local OpenAI-compatible gateway for Codex"
+repository = "https://github.com/bbrangeo/codex_ai"
+license = "MIT"
 edition = "2024"
 rust-version = "1.89"
 

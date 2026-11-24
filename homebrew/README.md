@@ -9,7 +9,7 @@ If the service is running, stop it before reinstalling. From the repository root
 ```sh
 tap_dir="$(brew --repository local/codex-ai)"
 cp homebrew/Formula/codex-ai.rb "$tap_dir/Formula/"
-tar -czf "$tap_dir/codex-ai-0.1.0.tar.gz" Cargo.toml Cargo.lock src
+tar -czf "$tap_dir/codex-ai-0.1.1.tar.gz" Cargo.toml Cargo.lock LICENSE src
 brew fetch --force --build-from-source local/codex-ai/codex-ai
 brew reinstall --build-from-source local/codex-ai/codex-ai
 brew test local/codex-ai/codex-ai
