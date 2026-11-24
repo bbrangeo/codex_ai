@@ -1,6 +1,16 @@
 name: Build macOS and Windows
 
-on: [workflow_dispatch]
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Build and test only, or also publish a release on the default branch
+        type: choice
+        required: true
+        default: build
+        options:
+          - build
+          - release
 
 permissions:
   contents: read
@@ -37,7 +47,7 @@ jobs:
 
   release:
     needs: build
-    if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    if: inputs.mode == 'release' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}

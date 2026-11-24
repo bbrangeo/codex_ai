@@ -128,7 +128,14 @@ No telemetry is sent externally. Request logs do not include full URLs, headers,
 
 ## Publishing a release
 
-Update the version in `Cargo.toml` and refresh `Cargo.lock` with `cargo update --workspace`. After a push to the default branch, GitHub Actions builds and tests both platforms. If the matching `v<version>` tag does not exist, it tags the tested commit and publishes the macOS Apple Silicon and Windows x86-64 archives to [GitHub Releases](https://github.com/bbrangeo/codex_ai/releases). The workflow then publishes the crate to crates.io if the tag points to that tested commit and the crate version is not already published. Existing tags and releases are left unchanged.
+Start the workflow from **Actions → Build macOS and Windows → Run workflow**. Choose `build` (the default) to compile and test both platforms without publishing, or `release` to also publish after the tests pass. For a release, update the version in `Cargo.toml`, refresh `Cargo.lock` with `cargo update --workspace`, and push the changes to `master` first.
+
+```sh
+gh workflow run build.yml --ref master -f mode=build
+gh workflow run build.yml --ref master -f mode=release
+```
+
+Only `release` runs on the default branch can publish. If the matching `v<version>` tag does not exist, the workflow tags the tested commit and publishes the macOS Apple Silicon and Windows x86-64 archives to [GitHub Releases](https://github.com/bbrangeo/codex_ai/releases). It then publishes the crate to crates.io if the tag points to that tested commit and the crate version is not already published. Existing tags and releases are left unchanged.
 
 To enable crates.io publishing for the first time:
 
