@@ -1,7 +1,10 @@
 use std::env;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::ErrorKind;
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -32,6 +35,8 @@ const CALLBACK_PATH: &str = "/auth/callback";
 const REFRESH_MARGIN: Duration = Duration::from_secs(300);
 const TOKEN_TIMEOUT: Duration = Duration::from_secs(30);
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
+#[cfg(windows)]
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
 pub(super) const ORIGINATOR: &str = "codex_ai";
 
 #[derive(Deserialize, Serialize)]
@@ -49,12 +54,23 @@ pub(super) struct Cache {
 
 impl Cache {
     pub(super) fn open() -> Result<Self> {
+        #[cfg(unix)]
         let directory = if let Some(path) = env::var_os("CODEX_CACHE_DIR") {
             PathBuf::from(path)
         } else if let Some(path) = env::var_os("XDG_CACHE_HOME").filter(|s| !s.is_empty()) {
             PathBuf::from(path).join("codex_ai")
         } else {
             PathBuf::from(env::var_os("HOME").context("HOME is not set")?).join(".cache/codex_ai")
+        };
+        #[cfg(windows)]
+        let directory = {
+            // Cache files inherit the ACL of the local Windows user profile.
+            ensure!(
+                env::var_os("CODEX_CACHE_DIR").is_none(),
+                "CODEX_CACHE_DIR is not supported on Windows; the cache uses LOCALAPPDATA"
+            );
+            PathBuf::from(env::var_os("LOCALAPPDATA").context("LOCALAPPDATA is not set")?)
+                .join("codex_ai")
         };
         Self::open_at(directory)
     }
@@ -64,24 +80,36 @@ impl Cache {
             directory.is_absolute(),
             "the cache directory path must be absolute"
         );
-        DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
+        let mut builder = DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        builder.mode(0o700);
+        builder
             .create(&directory)
             .with_context(|| format!("creating cache directory {}", directory.display()))?;
         let metadata = fs::symlink_metadata(&directory)?;
         ensure!(
-            metadata.is_dir() && metadata.permissions().mode() & 0o077 == 0,
-            "the cache directory must be a private directory, not a symlink (chmod 700): {}",
+            metadata.is_dir(),
+            "not a cache directory: {}",
             directory.display()
         );
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(directory.join("lock"))?;
+        #[cfg(unix)]
+        ensure!(
+            metadata.permissions().mode() & 0o077 == 0,
+            "the cache directory must be private (chmod 700): {}",
+            directory.display()
+        );
+        #[cfg(windows)]
+        ensure!(
+            metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+            "the cache directory must not be a Windows reparse point: {}",
+            directory.display()
+        );
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let lock = options.open(directory.join("lock"))?;
         lock.try_lock().context(
             "cache is locked or inaccessible; stop the other instance before continuing",
         )?;
@@ -97,9 +125,16 @@ impl Cache {
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error).context("reading the OAuth cache"),
         };
+        ensure!(metadata.is_file(), "the token file must be a regular file");
+        #[cfg(unix)]
         ensure!(
-            metadata.is_file() && metadata.permissions().mode() & 0o077 == 0,
-            "the token file must be a private regular file (chmod 600)"
+            metadata.permissions().mode() & 0o077 == 0,
+            "the token file must be private (chmod 600)"
+        );
+        #[cfg(windows)]
+        ensure!(
+            metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+            "the token file must not be a Windows reparse point"
         );
         let credentials: Credentials = serde_json::from_reader(File::open(&self.path)?)
             .map_err(|_| anyhow!("OAuth cache is unreadable; run `codex_ai login` again"))?;
@@ -542,6 +577,7 @@ mod tests {
         let cached = session.cache.load()?.context("fresh credentials on disk")?;
         assert_eq!(cached.refresh_token, "rotated");
         assert_eq!(cached.account_id.as_deref(), Some("account"));
+        #[cfg(unix)]
         assert_eq!(
             fs::metadata(&session.cache.path)?.permissions().mode() & 0o777,
             0o600

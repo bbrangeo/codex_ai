@@ -26,16 +26,27 @@ brew test local/codex-ai/codex-ai
 
 See the [Homebrew guide](homebrew/README.md) for upgrades, restarts, and logs.
 
-## Getting started with Cargo (macOS and Linux, Rust 1.89+)
+## Getting started with Cargo (macOS, Linux, and Windows; Rust 1.89+)
 
 ```sh
 cargo run --locked -- login
 ```
 
-Open the displayed URL in a browser **on the same machine** and authorize the sign-in. The OAuth callback uses port `1455`, or `1457` if the first port is in use. Then run:
+Open the displayed URL in a browser **on the same machine** and authorize the sign-in. The OAuth callback uses port `1455`, or `1457` if the first port is in use. Then start the server. On macOS and Linux:
 
 ```sh
 export CODEX_API_KEY="$(openssl rand -hex 32)"
+cargo run --locked -- serve
+```
+
+On Windows, set the local key in PowerShell instead:
+
+```powershell
+$key = New-Object byte[] 32
+$rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+$rng.GetBytes($key)
+$rng.Dispose()
+$env:CODEX_API_KEY = [Convert]::ToBase64String($key)
 cargo run --locked -- serve
 ```
 
@@ -106,7 +117,8 @@ No telemetry is sent externally. Debug mode does not log full URLs, headers, key
 
 ## Cache and security
 
-- Access and refresh tokens are stored in an unencrypted local `tokens.json` file (`0600` permissions, in a private directory with `0700` permissions). The cache location is chosen in this order: `CODEX_CACHE_DIR` (an absolute path), `$XDG_CACHE_HOME/codex_ai`, then `~/.cache/codex_ai`. Do not put the cache directory in a repository or shared folder.
+- On macOS and Linux, access and refresh tokens are stored unencrypted in `tokens.json` (`0600`) inside a private cache directory (`0700`). The directory is chosen in this order: `CODEX_CACHE_DIR` (an absolute path), `$XDG_CACHE_HOME/codex_ai`, then `~/.cache/codex_ai`. Do not put the cache directory in a repository or shared folder.
+- On Windows, the unencrypted `tokens.json` file is stored in `%LOCALAPPDATA%\codex_ai` and relies on the inherited permissions of the local user profile. `CODEX_CACHE_DIR` is not supported on Windows. Do not grant other users access to the cache.
 - The server reuses the access token, refreshes it as it nears expiry or after a `401` from Codex, and replaces the cache atomically. Only one process can use the cache at a time. If the session is revoked, stop the server and run `login` again.
 - `CODEX_LISTEN` lets you change the port or loopback address (for example, `127.0.0.1:8080`). Do not expose the server to the network: anyone with the local key can use your account's quota.
 - To clear the local cache, stop the server and run `codex-ai-service logout` (Homebrew) or `cargo run --locked -- logout` (Cargo). This does not revoke the session with OpenAI.
