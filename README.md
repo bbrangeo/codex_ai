@@ -1,20 +1,24 @@
 # codex_ai
 
-`codex_ai` is a local gateway for using a ChatGPT account with Codex access from an OpenAI-compatible client. Point a script, SDK, or app that supports a custom OpenAI base URL at `http://127.0.0.1:8787/v1`. It can then list your account's Codex models and request responses without a separate OpenAI API key.
+**Use ChatGPT Codex from an OpenAI-compatible client.**
 
-**The gateway runs on your machine; the models do not.** Prompts, any conversation history you include, and any tool results you send are forwarded to the ChatGPT Codex backend. You need an internet connection and a ChatGPT account with Codex access. Model availability and usage limits come from that account.
+Point your script, SDK, or app at `http://127.0.0.1:8787/v1` to list your
+account's Codex models and generate responses without a separate OpenAI API key.
 
-## How it works
+[Homebrew](#getting-started-with-homebrew-macos) · [Cargo](#getting-started-with-cargo-macos-linux-and-windows-rust-189) · [API examples](#calling-the-api) · [GitHub Releases](https://github.com/bbrangeo/codex_ai/releases) · [MIT License](LICENSE)
 
-1. Run `login` and sign in to ChatGPT in your browser. The gateway caches the resulting OAuth tokens locally and uses them to authenticate with Codex.
-2. Run `serve` with a `CODEX_API_KEY` you generate yourself. The server listens only on a loopback address, by default `127.0.0.1:8787`. The local key authenticates your client to the gateway; it is not sent to Codex. Your client does not need access to the OAuth tokens.
-3. Your client makes an HTTP request to the gateway. The gateway forwards Responses requests to Codex and translates Chat Completions requests into Responses requests. It sends back either a JSON response or a stream of server-sent events (SSE), depending on what the client requested.
+![Request path: your app calls codex_ai on your machine, which forwards requests to the remote ChatGPT Codex backend.](.github/codex-ai-flow.svg)
 
-This is not a local model runner, a replacement for the full OpenAI API, or a coding agent that edits files or executes your client's tools. See [compatibility and limits](#compatibility-and-limits) before pointing an existing app at the gateway.
+> [!IMPORTANT]
+> **The gateway runs locally; the models do not.** Prompts, conversation history,
+> and tool results you send are forwarded to ChatGPT Codex. You need an internet
+> connection and a ChatGPT account with Codex access. Model availability and
+> usage limits come from that account.
 
 ## Getting started with Homebrew (macOS)
 
-This repository also hosts the [Homebrew formula](Formula/codex-ai.rb). Give Homebrew the repository URL when adding the tap:
+**1. Install with Homebrew.** This repository hosts the
+[formula](Formula/codex-ai.rb). Give Homebrew the repository URL when adding the tap:
 
 ```sh
 brew tap bbrangeo/codex-ai https://github.com/bbrangeo/codex_ai.git
@@ -25,53 +29,34 @@ brew test bbrangeo/codex-ai/codex-ai
 
 `brew trust` approves only this formula. Skip that line if your Homebrew version does not have the command. `brew test` checks the launcher and its environment file in a temporary directory, without a ChatGPT account.
 
-1. Run `codex-ai-service --help` to create `~/.config/cosex_ai/env` with `0600` permissions.
-2. Generate a local key with `openssl rand -hex 32` and set `CODEX_API_KEY` in that file. You can also set `CODEX_LISTEN` (default: `127.0.0.1:8787`) or `CODEX_DEBUG=1`.
-3. Stop any existing `codex_ai serve` process, then run `codex-ai-service login`. Open the displayed URL in a browser **on the same machine** and complete sign-in.
-4. Run `brew services start bbrangeo/codex-ai/codex-ai` **without `sudo`** to start the service and have it restart at login. To run in the foreground instead, use `codex-ai-service serve`.
+**2. Configure and sign in.** Run `codex-ai-service --help` to create
+`~/.config/cosex_ai/env` with `0600` permissions. Generate a local key with
+`openssl rand -hex 32` and set `CODEX_API_KEY` in that file. You can also set
+`CODEX_LISTEN` (default: `127.0.0.1:8787`) or `CODEX_DEBUG=1`.
 
-### Switch from the previous GitHub tap
-
-If you previously added the tap from `bbrangeo/homebrew-codex-ai`, point it at this repository instead. Save any local changes to the tap first: `brew update-reset` resets that checkout. You do not need to uninstall `codex-ai`.
+Stop any existing gateway process, then run:
 
 ```sh
-brew tap --custom-remote bbrangeo/codex-ai https://github.com/bbrangeo/codex_ai.git
-brew update-reset "$(brew --repository bbrangeo/codex-ai)"
-brew trust --formula bbrangeo/codex-ai/codex-ai
-brew test bbrangeo/codex-ai/codex-ai
+codex-ai-service login
 ```
 
-### Upgrade with Homebrew
+Open the displayed URL in a browser **on the same machine** and complete sign-in.
+
+**3. Start the gateway** without `sudo`:
 
 ```sh
-brew update
-brew upgrade bbrangeo/codex-ai/codex-ai
-brew test bbrangeo/codex-ai/codex-ai
+brew services start bbrangeo/codex-ai/codex-ai
 ```
 
-Restart the service after upgrading if it was running. You do not need to sign in again while your existing OAuth session is valid.
+Homebrew restarts the service at login. To run in the foreground **instead**, use
+`codex-ai-service serve`.
 
-If you installed from the old `local/codex-ai` tap, stop that service if it is running and run `HOMEBREW_NO_AUTOREMOVE=1 brew uninstall local/codex-ai/codex-ai` before following the installation instructions above. This preserves your configuration and avoids removing unrelated dependencies.
-
-### Manage the Homebrew service
-
-```sh
-brew services info bbrangeo/codex-ai/codex-ai --json
-brew services restart bbrangeo/codex-ai/codex-ai
-brew services stop bbrangeo/codex-ai/codex-ai
-```
-
-The launcher reads `~/.config/cosex_ai/env` at every start without overwriting it. Use one assignment per line (`NAME=value` or `NAME='value with spaces'`). The file is sourced as shell code: keep it private and only put trusted content in it. Stop the service before running `codex-ai-service login` again: the service holds the login cache lock.
-
-To watch the service log:
-
-```sh
-tail -f "$(brew --prefix)/var/log/codex-ai.log"
-```
-
-To run in the foreground, stop the service first and run `codex-ai-service serve`.
+Already installed? See [Homebrew maintenance](#homebrew-maintenance) for service
+commands, upgrades, and switching taps.
 
 ## Getting started with Cargo (macOS, Linux, and Windows; Rust 1.89+)
+
+From a checkout of this repository, sign in:
 
 ```sh
 cargo run --locked -- login
@@ -97,9 +82,17 @@ cargo run --locked -- serve
 
 ## Calling the API
 
-Configure your OpenAI client with the **base URL `http://127.0.0.1:8787/v1`** and the **local `CODEX_API_KEY`**. This key is neither an OpenAI API key nor an OAuth token.
+| Client setting | Value |
+| --- | --- |
+| Base URL | `http://127.0.0.1:8787/v1` |
+| API key | Your local `CODEX_API_KEY` (not an OpenAI API key or an OAuth token) |
 
-The `curl` examples require the same key in the shell that runs them. If you installed via Homebrew and trust the contents of your environment file, you can load it in a POSIX shell:
+The `curl` examples need that same key in the shell that runs them.
+
+<details>
+<summary>Load the key from your Homebrew environment file</summary>
+
+If you trust the contents of the file, load it in a POSIX shell:
 
 ```sh
 set -a
@@ -107,14 +100,18 @@ set -a
 set +a
 ```
 
-To list the models available to your account:
+</details>
+
+### List available models
 
 ```sh
 curl -fsS http://127.0.0.1:8787/v1/models \
   -H "Authorization: Bearer $CODEX_API_KEY"
 ```
 
-To generate text with the Responses API, replace `MODEL_ID` with an `id` returned by `/v1/models`:
+### Generate a response
+
+Replace `MODEL_ID` with an `id` returned by `/v1/models`.
 
 ```sh
 curl -fsS http://127.0.0.1:8787/v1/responses \
@@ -123,7 +120,9 @@ curl -fsS http://127.0.0.1:8787/v1/responses \
   -d '{"model":"MODEL_ID","input":"Say hello."}'
 ```
 
-If your client uses Chat Completions instead, send the same prompt in a `messages` array:
+### Use Chat Completions instead
+
+Send the same prompt in a `messages` array:
 
 ```sh
 curl -fsS http://127.0.0.1:8787/v1/chat/completions \
@@ -132,7 +131,9 @@ curl -fsS http://127.0.0.1:8787/v1/chat/completions \
   -d '{"model":"MODEL_ID","messages":[{"role":"user","content":"Say hello."}]}'
 ```
 
-Both generation endpoints return JSON by default. To receive incremental events instead, add `"stream": true` to the request and use `curl -N` to see events as they arrive.
+> [!TIP]
+> Both generation endpoints return JSON by default. To stream events, add
+> `"stream": true` to the request and use `curl -N`.
 
 ## Supported API endpoints
 
@@ -142,7 +143,21 @@ Both generation endpoints return JSON by default. To receive incremental events 
 | `POST /v1/responses` | Generates responses as JSON or SSE (`stream: true`). Native Responses items and tools are forwarded to Codex, subject to backend support. |
 | `POST /v1/chat/completions` | Returns text, `function` tool calls, and usage as JSON or SSE. For images and other tool types, use Responses. |
 
+## How it works
+
+1. **Sign in.** `login` prints a URL for you to open in your browser. The gateway
+   caches the OAuth tokens locally and uses them to authenticate with Codex.
+2. **Connect to localhost.** `serve` listens only on a loopback address. Your
+   `CODEX_API_KEY` authenticates your client to the gateway; that key is not sent
+   to Codex, and your client does not need access to the OAuth tokens.
+3. **Send a request.** The gateway forwards Responses requests to Codex and
+   translates Chat Completions into Responses requests. It returns JSON or a
+   stream of server-sent events (SSE), depending on what the client requested.
+
 ## Compatibility and limits
+
+This is not a local model runner, a replacement for the full OpenAI API, or a
+coding agent that edits files or executes your client's tools.
 
 - **The client owns the conversation.** The gateway does not keep conversation state and sends `store: false` to Codex. Include the relevant history in `input` (Responses) or `messages` (Chat Completions) on each turn. Stored responses, `previous_response_id`, server-side conversations, and background mode are not supported.
 - **The client runs its own functions.** The gateway returns function calls and translates the results your client sends back; it does not execute those functions. For multi-turn tool workflows, prefer Responses and replay any opaque reasoning items alongside tool calls and results.
@@ -153,12 +168,32 @@ Leading `system` messages are sent to Codex as one leading `developer` message s
 
 ### Testing a Chat Completions tool call
 
+<details>
+<summary>Show the curl example</summary>
+
 ```sh
 curl -fsS http://127.0.0.1:8787/v1/chat/completions \
   -H "Authorization: Bearer $CODEX_API_KEY" \
   -H 'Content-Type: application/json' \
-  -d '{"model":"MODEL_ID","messages":[{"role":"user","content":"What time is it in Paris?"}],"tools":[{"type":"function","function":{"name":"get_local_time","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}],"tool_choice":{"type":"function","function":{"name":"get_local_time"}}}'
+  -d '{
+    "model": "MODEL_ID",
+    "messages": [{"role":"user","content":"What time is it in Paris?"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "get_local_time",
+        "parameters": {
+          "type": "object",
+          "properties": {"city":{"type":"string"}},
+          "required": ["city"]
+        }
+      }
+    }],
+    "tool_choice": {"type":"function","function":{"name":"get_local_time"}}
+  }'
 ```
+
+</details>
 
 Replace `MODEL_ID` with an `id` from `/v1/models`. The client receives `message.tool_calls`, runs the function, and sends the history back with the `assistant` message followed by a `tool` message whose `tool_call_id` matches the call's `id`. The gateway does not run the function. Legacy Chat `function_call` calls and `custom` tools are not supported on this endpoint.
 
@@ -186,6 +221,64 @@ No telemetry is sent externally. Request logs do not include full URLs, headers,
 - To clear the local cache, stop the server and run `codex-ai-service logout` (Homebrew) or `cargo run --locked -- logout` (Cargo). This does not revoke the session with OpenAI.
 
 `cargo test --locked` checks the cache and HTTP formats against a mock backend. No ChatGPT account is required.
+
+## Homebrew maintenance
+
+### Manage the Homebrew service
+
+```sh
+brew services info bbrangeo/codex-ai/codex-ai --json
+brew services restart bbrangeo/codex-ai/codex-ai
+brew services stop bbrangeo/codex-ai/codex-ai
+```
+
+The launcher reads `~/.config/cosex_ai/env` at every start without overwriting it.
+Use one assignment per line (`NAME=value` or `NAME='value with spaces'`). The
+file is sourced as shell code: keep it private and only put trusted content in it.
+Stop the service before running `codex-ai-service login` again: the service holds
+the login cache lock.
+
+To watch the service log:
+
+```sh
+tail -f "$(brew --prefix)/var/log/codex-ai.log"
+```
+
+To run in the foreground, stop the service first and run `codex-ai-service serve`.
+
+### Upgrade with Homebrew
+
+```sh
+brew update
+brew upgrade bbrangeo/codex-ai/codex-ai
+brew test bbrangeo/codex-ai/codex-ai
+```
+
+Restart the service after upgrading if it was running. You do not need to sign in
+again while your existing OAuth session is valid.
+
+### Switch from the previous GitHub tap
+
+If you previously added the tap from `bbrangeo/homebrew-codex-ai`, point it at
+this repository instead. Save any local changes to the tap first:
+`brew update-reset` resets that checkout. You do not need to uninstall `codex-ai`.
+
+```sh
+brew tap --custom-remote bbrangeo/codex-ai https://github.com/bbrangeo/codex_ai.git
+brew update-reset "$(brew --repository bbrangeo/codex-ai)"
+brew trust --formula bbrangeo/codex-ai/codex-ai
+brew test bbrangeo/codex-ai/codex-ai
+```
+
+If you installed from the old `local/codex-ai` tap instead, stop that service if
+it is running, then uninstall it before following the
+[Homebrew installation steps](#getting-started-with-homebrew-macos):
+
+```sh
+HOMEBREW_NO_AUTOREMOVE=1 brew uninstall local/codex-ai/codex-ai
+```
+
+This preserves your configuration and avoids removing unrelated dependencies.
 
 ## Publishing a release
 

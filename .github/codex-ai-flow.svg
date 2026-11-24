@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="840" height="194" viewBox="0 0 840 194" role="img" aria-labelledby="title desc">
+  <title id="title">The codex_ai request path</title>
+  <desc id="desc">Your OpenAI-compatible client calls codex_ai on your machine. The gateway forwards requests to the remote ChatGPT Codex backend.</desc>
+  <rect width="840" height="194" rx="16" fill="#111C30"/>
+  <rect x="24" y="24" width="502" height="146" rx="12" fill="none" stroke="#597196"/>
+  <g font-family="system-ui, sans-serif">
+    <g fill="#ADC3DF" font-size="16" font-weight="600">
+      <text x="42" y="52">On your machine</text>
+      <text x="610" y="52">Remote backend</text>
+    </g>
+    <rect x="42" y="67" width="200" height="85" rx="8" fill="#1A2942"/>
+    <rect x="306" y="67" width="200" height="85" rx="8" fill="#1A2942" stroke="#78DCE8"/>
+    <rect x="610" y="67" width="206" height="85" rx="8" fill="#1A2942"/>
+    <g fill="#EDF4FF" font-size="24" font-weight="650">
+      <text x="57" y="102">Your app</text>
+      <text x="321" y="102">codex_ai</text>
+      <text x="625" y="102">ChatGPT Codex</text>
+    </g>
+    <g fill="#ADC3DF" font-size="18">
+      <text x="57" y="129">OpenAI-compatible</text>
+      <text x="321" y="129" font-family="monospace">127.0.0.1:8787</text>
+      <text x="625" y="129">Runs the model</text>
+    </g>
+  </g>
+  <g fill="none" stroke="#78DCE8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M254 109h40m-7-7 7 7-7 7"/>
+    <path d="M518 109h80m-7-7 7 7-7 7"/>
+  </g>
+</svg>
