@@ -1,6 +1,16 @@
 # codex_ai
 
-A local Rust gateway that lets OpenAI clients use a ChatGPT account with Codex access. It draws on Zed's [`openai_subscribed.rs`](https://github.com/zed-industries/zed/blob/7279c76ef71d45504d7cfea00ee054f852ca0fbf/crates/openai_subscribed/src/openai_subscribed.rs), [`responses.rs`](https://github.com/zed-industries/zed/blob/7279c76ef71d45504d7cfea00ee054f852ca0fbf/crates/open_ai/src/responses.rs), and [`completion.rs`](https://github.com/zed-industries/zed/blob/7279c76ef71d45504d7cfea00ee054f852ca0fbf/crates/open_ai/src/completion.rs).
+`codex_ai` is a local gateway for using a ChatGPT account with Codex access from an OpenAI-compatible client. Point a script, SDK, or app that supports a custom OpenAI base URL at `http://127.0.0.1:8787/v1`. It can then list your account's Codex models and request responses without a separate OpenAI API key.
+
+**The gateway runs on your machine; the models do not.** Prompts, any conversation history you include, and any tool results you send are forwarded to the ChatGPT Codex backend. You need an internet connection and a ChatGPT account with Codex access. Model availability and usage limits come from that account.
+
+## How it works
+
+1. Run `login` and sign in to ChatGPT in your browser. The gateway caches the resulting OAuth tokens locally and uses them to authenticate with Codex.
+2. Run `serve` with a `CODEX_API_KEY` you generate yourself. The server listens only on a loopback address, by default `127.0.0.1:8787`. The local key authenticates your client to the gateway; it is not sent to Codex. Your client does not need access to the OAuth tokens.
+3. Your client makes an HTTP request to the gateway. The gateway forwards Responses requests to Codex and translates Chat Completions requests into Responses requests. It sends back either a JSON response or a stream of server-sent events (SSE), depending on what the client requested.
+
+This is not a local model runner, a replacement for the full OpenAI API, or a coding agent that edits files or executes your client's tools. See [compatibility and limits](#compatibility-and-limits) before pointing an existing app at the gateway.
 
 ## Getting started with Homebrew (macOS)
 
@@ -69,7 +79,7 @@ curl -fsS http://127.0.0.1:8787/v1/models \
   -H "Authorization: Bearer $CODEX_API_KEY"
 ```
 
-To generate text, replace `MODEL_ID` with an `id` returned by `/v1/models`:
+To generate text with the Responses API, replace `MODEL_ID` with an `id` returned by `/v1/models`:
 
 ```sh
 curl -fsS http://127.0.0.1:8787/v1/responses \
@@ -77,6 +87,17 @@ curl -fsS http://127.0.0.1:8787/v1/responses \
   -H 'Content-Type: application/json' \
   -d '{"model":"MODEL_ID","input":"Say hello."}'
 ```
+
+If your client uses Chat Completions instead, send the same prompt in a `messages` array:
+
+```sh
+curl -fsS http://127.0.0.1:8787/v1/chat/completions \
+  -H "Authorization: Bearer $CODEX_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"MODEL_ID","messages":[{"role":"user","content":"Say hello."}]}'
+```
+
+Both generation endpoints return JSON by default. To receive incremental events instead, add `"stream": true` to the request and use `curl -N` to see events as they arrive.
 
 ## Supported API endpoints
 
@@ -86,9 +107,14 @@ curl -fsS http://127.0.0.1:8787/v1/responses \
 | `POST /v1/responses` | Generates responses as JSON or SSE (`stream: true`). Native Responses items and tools are forwarded to Codex, subject to backend support. |
 | `POST /v1/chat/completions` | Returns text, `function` tool calls, and usage as JSON or SSE. For images and other tool types, use Responses. |
 
-The gateway does not retain conversation state: it sends `store: false`. Include the relevant history in `input` or `messages` on each turn. The gateway does not support `previous_response_id`, `background` mode, or embeddings, and it does not implement the full public OpenAI API. Available models, parameters, and quotas depend on your Codex access. The ChatGPT backend used here is not the public API at `api.openai.com` and may change.
+## Compatibility and limits
 
-Leading `system` messages are sent to Codex as a leading `developer` message so their text can be part of the cached prefix. An explicit Responses `instructions` field is forwarded separately. For stateful tool workflows over the stateless gateway, prefer Responses and replay any opaque reasoning items alongside tool calls and results.
+- **The client owns the conversation.** The gateway does not keep conversation state and sends `store: false` to Codex. Include the relevant history in `input` (Responses) or `messages` (Chat Completions) on each turn. Stored responses, `previous_response_id`, server-side conversations, and background mode are not supported.
+- **The client runs its own functions.** The gateway returns function calls and translates the results your client sends back; it does not execute those functions. For multi-turn tool workflows, prefer Responses and replay any opaque reasoning items alongside tool calls and results.
+- **Compatibility is limited to the endpoints above.** Embeddings are not supported, and not every OpenAI parameter is accepted. Supported options can vary by model. Chat Completions is limited to text and `function` tools; use Responses for features such as image input or other tool types where Codex supports them.
+- **The upstream is ChatGPT Codex, not `api.openai.com`.** The backend may change independently of the public OpenAI API.
+
+Leading `system` messages are sent to Codex as one leading `developer` message so their text can be part of the cached prefix. An explicit Responses `instructions` field is forwarded separately.
 
 ### Testing a Chat Completions tool call
 
