@@ -18,7 +18,7 @@ class CodexAi < Formula
       mkdir -p "$config_dir"
       if [ ! -e "$env_file" ]; then
         (set -C; printf '%s\\n' \
-          '# CODEX_API_KEY : générez la valeur avec openssl rand -hex 32' \
+          '# Generate a CODEX_API_KEY value with openssl rand -hex 32' \
           '# CODEX_API_KEY=' \
           '# CODEX_LISTEN=127.0.0.1:8787' > "$env_file")
       fi
@@ -39,9 +39,9 @@ class CodexAi < Formula
 
   def caveats
     <<~EOS
-      Exécutez codex-ai-service --help pour créer ~/.config/cosex_ai/env,
-      renseignez CODEX_API_KEY, puis exécutez codex-ai-service login avant
-      de lancer le service sans sudo.
+      Run codex-ai-service --help to create ~/.config/cosex_ai/env.
+      Set CODEX_API_KEY in that file, then run codex-ai-service login
+      before starting the service without sudo.
     EOS
   end
 

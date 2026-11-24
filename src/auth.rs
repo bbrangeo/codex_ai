@@ -54,7 +54,7 @@ impl Cache {
         } else if let Some(path) = env::var_os("XDG_CACHE_HOME").filter(|s| !s.is_empty()) {
             PathBuf::from(path).join("codex_ai")
         } else {
-            PathBuf::from(env::var_os("HOME").context("HOME est absent")?).join(".cache/codex_ai")
+            PathBuf::from(env::var_os("HOME").context("HOME is not set")?).join(".cache/codex_ai")
         };
         Self::open_at(directory)
     }
@@ -62,17 +62,17 @@ impl Cache {
     fn open_at(directory: PathBuf) -> Result<Self> {
         ensure!(
             directory.is_absolute(),
-            "le répertoire de cache doit être absolu"
+            "the cache directory path must be absolute"
         );
         DirBuilder::new()
             .recursive(true)
             .mode(0o700)
             .create(&directory)
-            .with_context(|| format!("création du cache {}", directory.display()))?;
+            .with_context(|| format!("creating cache directory {}", directory.display()))?;
         let metadata = fs::symlink_metadata(&directory)?;
         ensure!(
             metadata.is_dir() && metadata.permissions().mode() & 0o077 == 0,
-            "le répertoire de cache doit être réel et privé (chmod 700) : {}",
+            "the cache directory must be a private directory, not a symlink (chmod 700): {}",
             directory.display()
         );
         let lock = OpenOptions::new()
@@ -83,7 +83,7 @@ impl Cache {
             .mode(0o600)
             .open(directory.join("lock"))?;
         lock.try_lock().context(
-            "cache verrouillé ou inaccessible ; arrêtez l'autre instance avant de continuer",
+            "cache is locked or inaccessible; stop the other instance before continuing",
         )?;
         Ok(Self {
             path: directory.join("tokens.json"),
@@ -95,23 +95,23 @@ impl Cache {
         let metadata = match fs::symlink_metadata(&self.path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error).context("lecture du cache OAuth"),
+            Err(error) => return Err(error).context("reading the OAuth cache"),
         };
         ensure!(
             metadata.is_file() && metadata.permissions().mode() & 0o077 == 0,
-            "le fichier de jetons doit être régulier et privé (chmod 600)"
+            "the token file must be a private regular file (chmod 600)"
         );
         let credentials: Credentials = serde_json::from_reader(File::open(&self.path)?)
-            .map_err(|_| anyhow!("cache OAuth illisible ; relancez `codex_ai login`"))?;
+            .map_err(|_| anyhow!("OAuth cache is unreadable; run `codex_ai login` again"))?;
         ensure!(
             !credentials.access_token.is_empty() && !credentials.refresh_token.is_empty(),
-            "cache OAuth incomplet ; relancez `codex_ai login`"
+            "OAuth cache is incomplete; run `codex_ai login` again"
         );
         Ok(Some(credentials))
     }
 
     fn save(&self, credentials: &Credentials) -> Result<()> {
-        let directory = self.path.parent().context("répertoire de cache absent")?;
+        let directory = self.path.parent().context("missing cache directory")?;
         let mut file = tempfile::NamedTempFile::new_in(directory)?;
         serde_json::to_writer(file.as_file_mut(), credentials)?;
         file.as_file().sync_all()?;
@@ -123,7 +123,7 @@ impl Cache {
         match fs::remove_file(&self.path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error).context("suppression du cache OAuth"),
+            Err(error) => Err(error).context("removing the OAuth cache"),
         }
     }
 }
@@ -149,7 +149,7 @@ impl Session {
     pub(super) fn load(cache: Cache, client: Client) -> Result<Self> {
         let credentials = cache
             .load()?
-            .context("aucune session en cache ; lancez `codex_ai login`")?;
+            .context("no cached session; run `codex_ai login`")?;
         Ok(Self {
             cache,
             client,
@@ -216,7 +216,7 @@ impl Session {
             ])
             .send()
             .await
-            .context("rafraîchissement OAuth inaccessible")
+            .context("sending the OAuth token refresh request")
             .map_err(SessionError::Temporary)?;
         trace.event(format_args!(
             "oauth.refresh.http status={}",
@@ -230,7 +230,7 @@ impl Session {
             state.credentials = None;
             state.dirty = false;
             if let Err(error) = self.cache.remove() {
-                eprintln!("Impossible de supprimer le cache OAuth : {error:#}");
+                eprintln!("Could not remove the OAuth cache: {error:#}");
             }
             return Err(SessionError::LoginRequired);
         }
@@ -261,16 +261,16 @@ async fn read_tokens(
 ) -> Result<Credentials> {
     ensure!(
         response.status().is_success(),
-        "OAuth a répondu HTTP {}",
+        "OAuth endpoint returned HTTP {}",
         response.status()
     );
     let tokens: TokenResponse = response
         .json()
         .await
-        .map_err(|_| anyhow!("réponse OAuth invalide"))?;
+        .map_err(|_| anyhow!("invalid OAuth response"))?;
     ensure!(
         !tokens.access_token.is_empty(),
-        "jeton d'accès OAuth absent"
+        "missing OAuth access token"
     );
     // These claims are routing/expiry hints from the HTTPS token endpoint, not local authorization.
     let access_claims = claims(&tokens.access_token);
@@ -281,12 +281,12 @@ async fn read_tokens(
         .and_then(|seconds| now.checked_add(seconds))
         .or_else(|| access_claims.as_ref()?.get("exp")?.as_u64())
         .filter(|expires_at| *expires_at > now)
-        .context("expiration du jeton OAuth absente ou passée")?;
+        .context("OAuth token expiry is missing or already past")?;
     let refresh_token = tokens
         .refresh_token
         .filter(|token| !token.is_empty())
         .or_else(|| previous.map(|credentials| credentials.refresh_token.clone()))
-        .context("jeton de rafraîchissement OAuth absent")?;
+        .context("missing OAuth refresh token")?;
     let account_id = id_claims
         .as_ref()
         .and_then(account_id)
@@ -346,25 +346,25 @@ async fn callback(
         .as_deref()
         .is_some_and(|state| bool::from(state.as_bytes().ct_eq(login.state.as_bytes())))
     {
-        (StatusCode::BAD_REQUEST, "État OAuth invalide.")
+        (StatusCode::BAD_REQUEST, "Invalid OAuth state.")
     } else {
         let code = if query.error.is_some() {
-            Err("connexion refusée ou annulée par OpenAI")
+            Err("sign-in denied or canceled by OpenAI")
         } else {
             query
                 .code
                 .filter(|code| !code.is_empty())
-                .ok_or("code OAuth absent")
+                .ok_or("missing OAuth authorization code")
         };
         let (status, message) = if code.is_ok() {
             (
                 StatusCode::OK,
-                "Code reçu. Le résultat de la connexion s'affiche dans le terminal.",
+                "Authorization code received. Check the terminal for the sign-in result.",
             )
         } else {
             (
                 StatusCode::BAD_REQUEST,
-                "Connexion non terminée. Consultez le terminal.",
+                "Sign-in did not complete. Check the terminal.",
             )
         };
         if login.code.try_send(code).is_ok() {
@@ -372,7 +372,7 @@ async fn callback(
         } else {
             (
                 StatusCode::CONFLICT,
-                "Cette connexion a déjà reçu une réponse.",
+                "This sign-in attempt has already received a response.",
             )
         }
     };
@@ -387,7 +387,7 @@ pub(super) async fn login(cache: &Cache, client: &Client) -> Result<()> {
         }
         result => result,
     }
-    .context("ports OAuth 1455/1457 indisponibles sur localhost")?;
+    .context("OAuth callback ports 1455/1457 are unavailable on localhost")?;
     let redirect = format!(
         "http://localhost:{}{CALLBACK_PATH}",
         listener.local_addr()?.port()
@@ -415,16 +415,16 @@ pub(super) async fn login(cache: &Cache, client: &Client) -> Result<()> {
             state: state.into(),
             code,
         });
-    println!("Ouvrez cette URL sur cette machine pour vous connecter :\n{url}");
+    println!("Open this URL on the same machine to sign in:\n{url}");
     let code = tokio::select! {
         result = time::timeout(LOGIN_TIMEOUT, received.recv()) => {
-            result.context("délai de connexion OAuth dépassé")?
-                .context("callback OAuth interrompu")?
+            result.context("OAuth sign-in timed out")?
+                .context("OAuth callback was interrupted")?
                 .map_err(anyhow::Error::msg)?
         }
         result = async { axum::serve(listener, app).await } => {
-            result.context("serveur de callback OAuth")?;
-            bail!("serveur de callback OAuth interrompu");
+            result.context("OAuth callback server")?;
+            bail!("OAuth callback server stopped");
         }
     };
     let response = client
@@ -439,14 +439,15 @@ pub(super) async fn login(cache: &Cache, client: &Client) -> Result<()> {
         ])
         .send()
         .await
-        .context("échange du code OAuth")?;
+        .context("exchanging the OAuth authorization code")?;
     let credentials = read_tokens(response, None).await?;
-    cache.save(&credentials).context("écriture du cache OAuth")
+    cache.save(&credentials).context("writing the OAuth cache")
 }
 
 fn random_urlsafe() -> Result<String> {
     let mut bytes = [0; 32];
-    getrandom::fill(&mut bytes).map_err(|error| anyhow!("aléa OAuth indisponible : {error}"))?;
+    getrandom::fill(&mut bytes)
+        .map_err(|error| anyhow!("could not generate random bytes for OAuth: {error}"))?;
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 

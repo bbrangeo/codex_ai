@@ -149,10 +149,10 @@ pub(super) fn local_key(value: &str) -> Result<HeaderValue> {
             && value
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || b"-._~+/=".contains(&byte)),
-        "CODEX_API_KEY doit être une clé Bearer d'au moins 32 caractères ; utilisez `openssl rand -hex 32`"
+        "CODEX_API_KEY must be a bearer token of at least 32 characters; use `openssl rand -hex 32`"
     );
     let mut key = HeaderValue::from_str(&format!("Bearer {value}"))
-        .context("en-tête pour CODEX_API_KEY invalide")?;
+        .context("invalid authorization header for CODEX_API_KEY")?;
     key.set_sensitive(true);
     Ok(key)
 }
@@ -163,7 +163,7 @@ pub(super) fn router(codex: Codex, key: HeaderValue, debug: bool) -> Router {
         .route("/v1/responses", post(responses))
         .route("/v1/chat/completions", post(chat_completions))
         .route_layer(middleware::from_fn_with_state(key, authorize))
-        .fallback(|| async { ApiError::new(StatusCode::NOT_FOUND, "not_found", "route inconnue") })
+        .fallback(|| async { ApiError::new(StatusCode::NOT_FOUND, "not_found", "unknown route") })
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .layer(middleware::from_fn_with_state(debug, trace_request))
         .with_state(Arc::new(codex))
@@ -218,7 +218,7 @@ async fn authorize(State(key): State<HeaderValue>, request: Request, next: Next)
         ApiError::new(
             StatusCode::UNAUTHORIZED,
             "invalid_api_key",
-            "clé locale absente ou invalide",
+            "missing or invalid local API key",
         ),
     )
         .into_response()
@@ -297,13 +297,13 @@ async fn chat_completions(
 fn normalize_request(body: &mut Value) -> Result<bool, ApiError> {
     let body = body
         .as_object_mut()
-        .ok_or_else(|| ApiError::invalid("un objet JSON est requis"))?;
+        .ok_or_else(|| ApiError::invalid("expected a JSON object"))?;
     if !body
         .get("model")
         .and_then(Value::as_str)
         .is_some_and(|model| !model.trim().is_empty())
     {
-        return Err(ApiError::invalid("model doit être une chaîne non vide"));
+        return Err(ApiError::invalid("model must be a non-empty string"));
     }
     if ["previous_response_id", "conversation"]
         .into_iter()
@@ -314,27 +314,23 @@ fn normalize_request(body: &mut Value) -> Result<bool, ApiError> {
         })
     {
         return Err(ApiError::invalid(
-            "les réponses stockées, les conversations serveur et le mode background ne sont pas pris en charge",
+            "stored responses, server-side conversations, and background mode are not supported",
         ));
     }
     let stream = match body.get("stream") {
         None | Some(Value::Null) => false,
         Some(Value::Bool(stream)) => *stream,
-        _ => return Err(ApiError::invalid("stream doit être un booléen")),
+        _ => return Err(ApiError::invalid("stream must be a boolean")),
     };
     let mut instructions = match body.remove("instructions") {
         None | Some(Value::Null) => String::new(),
         Some(Value::String(value)) => value,
-        _ => return Err(ApiError::invalid("instructions doit être une chaîne")),
+        _ => return Err(ApiError::invalid("instructions must be a string")),
     };
     let input = match body.remove("input") {
         Some(Value::String(text)) => vec![json!({"role": "user", "content": text})],
         Some(Value::Array(input)) => input,
-        _ => {
-            return Err(ApiError::invalid(
-                "input doit être une chaîne ou un tableau",
-            ));
-        }
+        _ => return Err(ApiError::invalid("input must be a string or an array")),
     };
     body.insert(
         "input".into(),
@@ -418,9 +414,9 @@ fn events(
         let content_type = upstream.headers().get(header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.split(';').next())
-            .map_or_else(|| "absent".into(), |mime| mime.trim().to_ascii_lowercase());
+            .map_or_else(|| "missing".into(), |mime| mime.trim().to_ascii_lowercase());
         let format_error = || ApiError::gateway(format!(
-            "réponse Codex ni SSE ni JSON Responses (HTTP {status}, Content-Type : {content_type})"
+            "Codex returned neither SSE nor Responses JSON (HTTP {status}, Content-Type: {content_type})"
         ));
         if matches!(content_type.as_str(), "text/html" | "application/xhtml+xml") {
             trace.event(format_args!("codex.body format=html"));
@@ -464,7 +460,7 @@ fn json_response_events(response: Value) -> Result<Vec<Value>, ApiError> {
         Some("incomplete") => "response.incomplete",
         _ => {
             return Err(ApiError::gateway(
-                "la réponse JSON de Codex n'est pas terminée",
+                "Codex JSON response is not in a terminal state",
             ));
         }
     };
@@ -523,7 +519,7 @@ fn sse_events(upstream: reqwest::Response) -> impl Stream<Item = Result<Value, A
                 Ok(event) => event,
                 Err(_) => {
                     return Some(Err(ApiError::gateway(
-                        "flux SSE de Codex interrompu ou invalide",
+                        "Codex SSE stream was interrupted or invalid",
                     )));
                 }
             };
@@ -540,7 +536,7 @@ fn sse_events(upstream: reqwest::Response) -> impl Stream<Item = Result<Value, A
                                 .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
                     })
                 })
-                .ok_or_else(|| ApiError::gateway("événement SSE de Codex invalide"));
+                .ok_or_else(|| ApiError::gateway("invalid Codex SSE event"));
             Some(decoded)
         })
         .map(move |event| {
@@ -549,7 +545,7 @@ fn sse_events(upstream: reqwest::Response) -> impl Stream<Item = Result<Value, A
             if terminal_success(kind) {
                 let response = &mut event["response"];
                 if !response.is_object() {
-                    return Err(ApiError::gateway("réponse finale Codex manquante"));
+                    return Err(ApiError::gateway("missing final Codex response"));
                 }
                 // Codex may only send completed items in their own SSE events.
                 if response["output"].as_array().is_none_or(Vec::is_empty) && !items.is_empty() {
@@ -589,7 +585,7 @@ async fn collect_response(upstream: reqwest::Response, trace: Trace) -> Result<V
         }
     }
     Err(ApiError::gateway(
-        "le flux Codex s'est terminé sans réponse finale",
+        "Codex stream ended without a final response",
     ))
 }
 
@@ -605,7 +601,7 @@ fn stream_response(upstream: reqwest::Response, mut output: Output, trace: Trace
             let event = match events.next().await {
                 Some(Ok(event)) => event,
                 Some(Err(error)) => break error,
-                None => break ApiError::gateway("le flux Codex s'est terminé sans réponse finale"),
+                None => break ApiError::gateway("Codex stream ended without a final response"),
             };
             let kind = event["type"].as_str().unwrap_or_default();
             let terminal = terminal_success(kind) || terminal_failure(kind);
@@ -675,7 +671,7 @@ impl ApiError {
             return Self::new(
                 StatusCode::BAD_GATEWAY,
                 "codex_authentication_failed",
-                "Codex a refusé la session ; arrêtez le serveur et relancez `codex_ai login`",
+                "Codex rejected the session; stop the server and run `codex_ai login` again",
             );
         }
         let message = if status.is_client_error() && status != StatusCode::FORBIDDEN {
@@ -688,7 +684,7 @@ impl ApiError {
         } else {
             None
         };
-        let message = message.unwrap_or_else(|| format!("Codex a répondu HTTP {status}"));
+        let message = message.unwrap_or_else(|| format!("Codex returned HTTP {status}"));
         if status.is_client_error() {
             Self::new(status, "codex_request_rejected", message)
         } else {
@@ -702,7 +698,7 @@ impl ApiError {
                 .as_str()
                 .or_else(|| event["error"]["message"].as_str())
                 .or_else(|| event["message"].as_str())
-                .unwrap_or("la génération Codex a échoué"),
+                .unwrap_or("Codex generation failed"),
         )
     }
 
@@ -722,7 +718,7 @@ impl From<JsonRejection> for ApiError {
         Self::new(
             error.status(),
             "invalid_json",
-            "corps JSON invalide ou trop volumineux ; Content-Type: application/json requis",
+            "invalid or oversized JSON body; Content-Type: application/json is required",
         )
     }
 }
@@ -733,10 +729,10 @@ impl From<reqwest::Error> for ApiError {
             Self::new(
                 StatusCode::GATEWAY_TIMEOUT,
                 "upstream_timeout",
-                "Codex n'a pas répondu dans le délai imparti",
+                "Codex did not respond in time",
             )
         } else {
-            Self::gateway("réponse Codex inaccessible ou invalide")
+            Self::gateway("Codex response is unavailable or invalid")
         }
     }
 }
@@ -747,11 +743,11 @@ impl From<SessionError> for ApiError {
             SessionError::LoginRequired => Self::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "codex_login_required",
-                "arrêtez le serveur puis relancez `codex_ai login`",
+                "stop the server and run `codex_ai login` again",
             ),
             SessionError::Temporary(error) => {
-                eprintln!("Échec de la session Codex : {error:#}");
-                Self::gateway("mise à jour de la session Codex temporairement impossible")
+                eprintln!("Codex session failed: {error:#}");
+                Self::gateway("temporarily unable to update the Codex session")
             }
         }
     }
@@ -835,20 +831,20 @@ mod tests {
                 assert_eq!(headers["chatgpt-account-id"], "test-account");
                 assert_eq!(body["store"], false);
                 assert_eq!(body["stream"], true);
-                assert_eq!(body["input"][0]["content"][0]["text"], "Bonjour");
+                assert_eq!(body["input"][0]["content"][0]["text"], "Hello");
                 let item = json!({"type": "message", "role": "assistant", "content": [
-                    {"type": "output_text", "text": "Salut", "annotations": []}
+                    {"type": "output_text", "text": "Hi", "annotations": []}
                 ]});
                 let summary = json!({"id": "resp_test", "model": body["model"], "created_at": 1, "object": "response", "status": "completed", "output": [item], "usage": {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3}});
                 if body["model"] == "mock-json" {
                     return Json(summary).into_response();
                 }
                 if body["model"] == "mock-html" {
-                    return ([(header::CONTENT_TYPE, "text/html")], "<html>ne pas renvoyer</html>").into_response();
+                    return ([(header::CONTENT_TYPE, "text/html")], "<html>do not forward</html>").into_response();
                 }
                 let events = [
                     json!({"type": "response.created", "response": {"id": "resp_test", "model": "mock-model", "created_at": 1}}),
-                    json!({"type": "response.output_text.delta", "delta": "Salut"}),
+                    json!({"type": "response.output_text.delta", "delta": "Hi"}),
                     json!({"type": "response.output_item.done", "output_index": 0, "item": item}),
                     json!({"type": "response.completed", "response": {"id": "resp_test", "object": "response", "output": [], "usage": {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3}}}),
                 ];
@@ -885,7 +881,7 @@ mod tests {
             client
                 .post(&url)
                 .bearer_auth(KEY)
-                .json(&json!({"model":"mock-model", "input":"Bonjour", "stream":stream}))
+                .json(&json!({"model":"mock-model", "input":"Hello", "stream":stream}))
         };
         let response: Value = request(false)
             .send()
@@ -893,7 +889,7 @@ mod tests {
             .error_for_status()?
             .json()
             .await?;
-        assert_eq!(response["output"][0]["content"][0]["text"], "Salut");
+        assert_eq!(response["output"][0]["content"][0]["text"], "Hi");
         let events = request(true)
             .send()
             .await?
@@ -907,16 +903,16 @@ mod tests {
             .filter_map(|line| line.strip_prefix("data: "))
             .filter_map(|data| serde_json::from_str::<Value>(data).ok())
             .find(|event| event["type"] == "response.completed")
-            .context("événement final attendu")?;
+            .context("expected a final event")?;
         assert_eq!(
             completed["response"]["output"][0]["content"][0]["text"],
-            "Salut"
+            "Hi"
         );
 
         let url = format!("{local}/v1/chat/completions");
         let request = |model, stream| {
             client.post(&url).bearer_auth(KEY).json(&json!({
-                "model": model, "messages": [{"role": "user", "content": "Bonjour"}], "stream": stream
+                "model": model, "messages": [{"role": "user", "content": "Hello"}], "stream": stream
             }))
         };
         for model in ["mock-model", "mock-plain", "mock-json"] {
@@ -927,7 +923,7 @@ mod tests {
                 "upstream format for {model}"
             );
             let chat: Value = response.json().await?;
-            assert_eq!(chat["choices"][0]["message"]["content"], "Salut");
+            assert_eq!(chat["choices"][0]["message"]["content"], "Hi");
             let chunks = request(model, true)
                 .send()
                 .await?
@@ -935,7 +931,7 @@ mod tests {
                 .text()
                 .await?;
             assert!(
-                chunks.contains("\"content\":\"Salut\""),
+                chunks.contains("\"content\":\"Hi\""),
                 "stream should contain text for {model}"
             );
             assert!(chunks.contains("data: [DONE]"));
@@ -945,9 +941,9 @@ mod tests {
         let error: Value = response.json().await?;
         let message = error["error"]["message"]
             .as_str()
-            .context("message d'erreur attendu")?;
+            .context("expected an error message")?;
         assert!(message.contains("text/html"));
-        assert!(!message.contains("ne pas renvoyer"));
+        assert!(!message.contains("do not forward"));
         local_task.abort();
         upstream_task.abort();
         Ok(())
@@ -961,7 +957,7 @@ mod tests {
         const ITEM_ID: &str = "fc_local_time";
         const ARGUMENT_DELTAS: [&str; 2] = [r#"{"city":"#, r#""Paris"}"#];
         const TOOL_OUTPUT: &str = "14:30";
-        const ANSWER: &str = "Il est 14 h 30 à Paris.";
+        const ANSWER: &str = "It's 2:30 p.m. in Paris.";
         let arguments = ARGUMENT_DELTAS.concat();
         let parameters = json!({
             "type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]
@@ -1034,7 +1030,7 @@ mod tests {
         codex.base_url = upstream;
         let (local, local_task) = start(router(codex, local_key(KEY)?, true)).await?;
         let url = format!("{local}/v1/chat/completions");
-        let user = json!({"role": "user", "content": "Quelle heure est-il à Paris ?"});
+        let user = json!({"role": "user", "content": "What time is it in Paris?"});
         let request = |messages: Value, stream| {
             client.post(&url).bearer_auth(KEY).json(&json!({
                 "model": "mock-model", "messages": messages, "tools": chat_tools, "stream": stream
@@ -1056,7 +1052,7 @@ mod tests {
             .into_iter()
             .map(serde_json::from_str)
             .collect::<std::result::Result<_, _>>()?;
-        let (last, preceding) = chunks.split_last().context("chunk final attendu")?;
+        let (last, preceding) = chunks.split_last().context("expected a final chunk")?;
         assert_eq!(last["choices"][0]["index"], 0);
         assert_eq!(last["choices"][0]["finish_reason"], "tool_calls");
         let mut calls = Vec::new();

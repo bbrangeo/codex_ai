@@ -1,78 +1,78 @@
 # codex_ai
 
-Passerelle Rust locale entre un compte ChatGPT ayant accès à Codex et des clients OpenAI. Elle s’inspire de [`openai_subscribed.rs`](https://github.com/zed-industries/zed/blob/7279c76ef71d45504d7cfea00ee054f852ca0fbf/crates/openai_subscribed/src/openai_subscribed.rs), de [`responses.rs`](https://github.com/zed-industries/zed/blob/7279c76ef71d45504d7cfea00ee054f852ca0fbf/crates/open_ai/src/responses.rs) et de [`completion.rs`](https://github.com/zed-industries/zed/blob/7279c76ef71d45504d7cfea00ee054f852ca0fbf/crates/open_ai/src/completion.rs) de Zed.
+A local Rust gateway that lets OpenAI clients use a ChatGPT account with Codex access. It draws on Zed's [`openai_subscribed.rs`](https://github.com/zed-industries/zed/blob/7279c76ef71d45504d7cfea00ee054f852ca0fbf/crates/openai_subscribed/src/openai_subscribed.rs), [`responses.rs`](https://github.com/zed-industries/zed/blob/7279c76ef71d45504d7cfea00ee054f852ca0fbf/crates/open_ai/src/responses.rs), and [`completion.rs`](https://github.com/zed-industries/zed/blob/7279c76ef71d45504d7cfea00ee054f852ca0fbf/crates/open_ai/src/completion.rs).
 
-Pour installer et gérer le service avec `brew services`, suivez le [guide Homebrew](homebrew/README.md).
+To install and manage the service with `brew services`, see the [Homebrew guide](homebrew/README.md).
 
-## Démarrage (macOS et Linux, Rust 1.89+)
+## Getting started (macOS and Linux, Rust 1.89+)
 
 ```sh
 cargo run --locked -- login
 ```
 
-Ouvrez l’URL affichée dans un navigateur **sur la même machine**, puis autorisez la connexion. Le callback OAuth utilise le port `1455`, ou `1457` si le premier est occupé. Ensuite :
+Open the displayed URL in a browser **on the same machine** and authorize the sign-in. The OAuth callback uses port `1455`, or `1457` if the first port is in use. Then run:
 
 ```sh
 export CODEX_API_KEY="$(openssl rand -hex 32)"
 cargo run --locked -- serve
 ```
 
-Configurez votre client OpenAI avec la **base URL `http://127.0.0.1:8787/v1`** et la **clé locale `CODEX_API_KEY`**. Cette clé n’est ni une clé OpenAI ni un jeton OAuth. Pour voir les modèles autorisés sur votre compte (depuis un terminal qui connaît la même clé) :
+Configure your OpenAI client with the **base URL `http://127.0.0.1:8787/v1`** and the **local `CODEX_API_KEY`**. This key is neither an OpenAI API key nor an OAuth token. To list the models available to your account, run this from a shell with the same key:
 
 ```sh
 curl -fsS http://127.0.0.1:8787/v1/models \
   -H "Authorization: Bearer $CODEX_API_KEY"
 ```
 
-Pour générer du texte, utilisez un `id` renvoyé par `/v1/models` à la place de `MODELE` :
+To generate text, replace `MODEL_ID` with an `id` returned by `/v1/models`:
 
 ```sh
 curl -fsS http://127.0.0.1:8787/v1/responses \
   -H "Authorization: Bearer $CODEX_API_KEY" \
   -H 'Content-Type: application/json' \
-  -d '{"model":"MODELE","input":"Réponds bonjour."}'
+  -d '{"model":"MODEL_ID","input":"Say hello."}'
 ```
 
-## API prise en charge
+## Supported API endpoints
 
-| Route | Comportement |
+| Endpoint | Behavior |
 | --- | --- |
-| `GET /v1/models` | Modèles visibles dans le catalogue du compte Codex. |
-| `POST /v1/responses` | Génération JSON ou SSE (`stream: true`). Les items et outils Responses natifs sont transmis à Codex, sous réserve de ce que le backend accepte. |
-| `POST /v1/chat/completions` | Texte, appels d’outils de type `function` et usage, en JSON ou SSE. Pour les images et les autres types d’outils, utilisez Responses. |
+| `GET /v1/models` | Lists models visible in your Codex account's catalog. |
+| `POST /v1/responses` | Generates responses as JSON or SSE (`stream: true`). Native Responses items and tools are forwarded to Codex, subject to backend support. |
+| `POST /v1/chat/completions` | Returns text, `function` tool calls, and usage as JSON or SSE. For images and other tool types, use Responses. |
 
-La passerelle est sans état de conversation : elle envoie `store: false`. Renvoyez l’historique pertinent dans `input` ou `messages` à chaque tour. Pas de `previous_response_id`, de mode `background`, d’embeddings ni de prise en charge complète de l’API OpenAI publique. Les modèles, paramètres et quotas dépendent de votre accès Codex. Le backend ChatGPT utilisé ici n’est pas l’API publique `api.openai.com` et peut changer.
+The gateway does not retain conversation state: it sends `store: false`. Include the relevant history in `input` or `messages` on each turn. The gateway does not support `previous_response_id`, `background` mode, or embeddings, and it does not implement the full public OpenAI API. Available models, parameters, and quotas depend on your Codex access. The ChatGPT backend used here is not the public API at `api.openai.com` and may change.
 
-### Tester un outil Chat Completions
+### Testing a Chat Completions tool call
 
 ```sh
 curl -fsS http://127.0.0.1:8787/v1/chat/completions \
   -H "Authorization: Bearer $CODEX_API_KEY" \
   -H 'Content-Type: application/json' \
-  -d '{"model":"MODELE","messages":[{"role":"user","content":"Quelle heure est-il à Paris ?"}],"tools":[{"type":"function","function":{"name":"get_local_time","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}],"tool_choice":{"type":"function","function":{"name":"get_local_time"}}}'
+  -d '{"model":"MODEL_ID","messages":[{"role":"user","content":"What time is it in Paris?"}],"tools":[{"type":"function","function":{"name":"get_local_time","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}],"tool_choice":{"type":"function","function":{"name":"get_local_time"}}}'
 ```
 
-Remplacez `MODELE` par un `id` de `/v1/models`. Le client reçoit `message.tool_calls`, exécute la fonction et renvoie l’historique avec le message `assistant`, puis un message `tool` dont le `tool_call_id` reprend l’`id` de l’appel. Le connecteur n’exécute pas la fonction. Les appels `function_call` de l’ancienne API Chat et les outils `custom` ne sont pas pris en charge ici.
+Replace `MODEL_ID` with an `id` from `/v1/models`. The client receives `message.tool_calls`, runs the function, and sends the history back with the `assistant` message followed by a `tool` message whose `tool_call_id` matches the call's `id`. The gateway does not run the function. Legacy Chat `function_call` calls and `custom` tools are not supported on this endpoint.
 
-Pour un client distant qui utilise `stream: true` (comme Cursor Agent), le tunnel doit prendre en charge le SSE. Les Quick Tunnels `trycloudflare.com` ne le prennent pas en charge.
+If a remote client uses `stream: true` (like Cursor Agent), the tunnel must support SSE. Quick Tunnels at `trycloudflare.com` do not support SSE.
 
-## Mode debug
+## Debug mode
 
-Démarrez le serveur avec `CODEX_DEBUG=1` pour suivre les requêtes dans le terminal :
+Start the server with `CODEX_DEBUG=1` to trace requests in the terminal:
 
 ```sh
 CODEX_DEBUG=1 ./target/debug/codex_ai serve
 ```
 
-Les événements de diagnostic sont écrits sur `stderr`, avec le même `request` et un `elapsed_ms` relatif au début de chaque requête. Ils indiquent la route, le statut HTTP, le modèle GPT reconnu, le nombre d’outils, l’état du cache OAuth et la fin ou l’erreur du flux Codex. En mode SSE, `http.response` indique l’envoi des en-têtes, pas la fin de la génération : regardez ensuite `codex.stream.end` ou `codex.stream.error`.
+Diagnostic events are written to `stderr`. Events for the same request share a `request` ID, and `elapsed_ms` measures time since the request started. They report the route, HTTP status, recognized GPT model, tool count, OAuth cache status, and whether the Codex stream finished or failed. In SSE mode, `http.response` marks when headers are sent, not when generation finishes. Look for `codex.stream.end` or `codex.stream.error` afterward.
 
-Aucune télémétrie n’est envoyée à l’extérieur. Les URL complètes, en-têtes, clés, prompts, réponses et arguments d’outils ne sont pas journalisés par ce mode. Retirez `CODEX_DEBUG=1` et redémarrez pour le désactiver. Avec `brew services`, ajoutez `CODEX_DEBUG=1` au [fichier d’environnement du service](homebrew/README.md), puis relancez le service pour que les logs apparaissent dans son fichier de journal habituel.
+No telemetry is sent externally. Debug mode does not log full URLs, headers, keys, prompts, responses, or tool arguments. Remove `CODEX_DEBUG=1` and restart the server to disable it. If you use `brew services`, add `CODEX_DEBUG=1` to the [service environment file](homebrew/README.md) and restart the service. Diagnostic output will appear in the usual service log.
 
-## Cache et sécurité
+## Cache and security
 
-- Les jetons d’accès et de rafraîchissement restent dans un fichier local non chiffré `tokens.json` (permissions `0600`, répertoire privé `0700`). Priorité des chemins : `CODEX_CACHE_DIR` (absolu), `$XDG_CACHE_HOME/codex_ai`, puis `~/.cache/codex_ai`. Ne placez pas ce répertoire dans un dépôt ou un dossier partagé.
-- Le serveur réutilise le jeton d’accès, le rafraîchit à l’approche de son expiration ou après un `401` de Codex et remplace le cache atomiquement. Un seul processus peut utiliser ce cache à la fois. Si la session est révoquée, arrêtez le serveur et relancez `login`.
-- `CODEX_LISTEN` permet de changer le port ou l’adresse de boucle locale (par exemple `127.0.0.1:8080`). Ne publiez pas ce serveur sur le réseau : toute personne possédant la clé locale peut consommer le quota du compte.
-- Pour effacer le cache local, arrêtez le serveur puis lancez `cargo run --locked -- logout`. Cette commande ne révoque pas la session chez OpenAI.
+- Access and refresh tokens are stored in an unencrypted local `tokens.json` file (`0600` permissions, in a private directory with `0700` permissions). The cache location is chosen in this order: `CODEX_CACHE_DIR` (an absolute path), `$XDG_CACHE_HOME/codex_ai`, then `~/.cache/codex_ai`. Do not put the cache directory in a repository or shared folder.
+- The server reuses the access token, refreshes it as it nears expiry or after a `401` from Codex, and replaces the cache atomically. Only one process can use the cache at a time. If the session is revoked, stop the server and run `login` again.
+- `CODEX_LISTEN` lets you change the port or loopback address (for example, `127.0.0.1:8080`). Do not expose the server to the network: anyone with the local key can use your account's quota.
+- To clear the local cache, stop the server and run `cargo run --locked -- logout`. This does not revoke the session with OpenAI.
 
-`cargo test --locked` vérifie le cache et les formats HTTP sur un backend simulé, sans compte ChatGPT.
+`cargo test --locked` checks the cache and HTTP formats against a mock backend. No ChatGPT account is required.

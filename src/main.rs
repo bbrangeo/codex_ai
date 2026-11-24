@@ -22,23 +22,23 @@ async fn main() -> Result<()> {
         [arg] if arg == "login" => {
             let cache = auth::Cache::open()?;
             auth::login(&cache, &http_client()?).await?;
-            println!("Connexion réussie. Les jetons sont enregistrés dans le cache privé.");
+            println!("Signed in successfully. Tokens are saved in the private cache.");
         }
         [arg] if arg == "serve" => serve().await?,
         [arg] if arg == "logout" => {
             auth::Cache::open()?.remove()?;
-            println!("Cache de connexion supprimé.");
+            println!("Login cache cleared.");
         }
-        _ => bail!("usage : codex_ai <login|serve|logout>"),
+        _ => bail!("usage: codex_ai <login|serve|logout>"),
     }
     Ok(())
 }
 
 fn help() {
     println!(
-        "codex_ai login   Authentifier un compte ChatGPT et mettre les jetons en cache\n\
-              codex_ai serve   Démarrer l'API locale (CODEX_API_KEY requis, CODEX_DEBUG=1 pour les logs)\n\
-              codex_ai logout  Effacer les jetons du cache local"
+        "codex_ai login   Sign in to a ChatGPT account and cache tokens\n\
+              codex_ai serve   Start the local API (CODEX_API_KEY required, CODEX_DEBUG=1 for diagnostic logs)\n\
+              codex_ai logout  Clear tokens from the local cache"
     );
 }
 
@@ -49,21 +49,21 @@ fn http_client() -> Result<Client> {
         .read_timeout(Duration::from_secs(120))
         .user_agent(concat!("codex_ai/", env!("CARGO_PKG_VERSION")))
         .build()
-        .context("construction du client HTTP")
+        .context("building the HTTP client")
 }
 
 async fn serve() -> Result<()> {
-    let key = api::local_key(&env::var("CODEX_API_KEY").context("CODEX_API_KEY est requis")?)?;
+    let key = api::local_key(&env::var("CODEX_API_KEY").context("CODEX_API_KEY is required")?)?;
     let address: SocketAddr = match env::var("CODEX_LISTEN") {
         Ok(address) => address
             .parse()
-            .context("CODEX_LISTEN doit être une adresse IP et un port")?,
+            .context("CODEX_LISTEN must specify an IP address and port")?,
         Err(env::VarError::NotPresent) => SocketAddr::from((Ipv4Addr::LOCALHOST, DEFAULT_PORT)),
-        Err(error) => return Err(error).context("CODEX_LISTEN invalide"),
+        Err(error) => return Err(error).context("invalid CODEX_LISTEN"),
     };
     ensure!(
         address.ip().is_loopback(),
-        "CODEX_LISTEN doit être une adresse loopback"
+        "CODEX_LISTEN must use a loopback address"
     );
     let client = http_client()?;
     let session = auth::Session::load(auth::Cache::open()?, client.clone())?;
@@ -71,17 +71,17 @@ async fn serve() -> Result<()> {
     let router = api::router(api::Codex::new(client, session), key, debug);
     let listener = TcpListener::bind(address)
         .await
-        .context("écoute de l'API locale")?;
-    println!("API OpenAI : http://{}/v1", listener.local_addr()?);
+        .context("binding the local API listener")?;
+    println!("OpenAI API: http://{}/v1", listener.local_addr()?);
     if debug {
-        eprintln!("Journalisation de diagnostic activée (CODEX_DEBUG=1)");
+        eprintln!("Diagnostic logging enabled (CODEX_DEBUG=1)");
     }
     axum::serve(listener, router)
         .with_graceful_shutdown(async {
             if let Err(error) = tokio::signal::ctrl_c().await {
-                eprintln!("Impossible d'attendre Ctrl-C : {error}");
+                eprintln!("Could not wait for Ctrl-C: {error}");
             }
         })
         .await
-        .context("serveur API")
+        .context("API server")
 }

@@ -1,6 +1,6 @@
-# Installation avec Homebrew
+# Installing with Homebrew
 
-La formule `codex-ai` compile le projet Rust depuis une archive locale. Depuis la racine du dépôt :
+The `codex-ai` formula builds the Rust project from a local archive. Run the following from the repository root:
 
 ```sh
 tap_dir="$(brew --repository local/codex-ai)"
@@ -11,17 +11,17 @@ brew trust --formula local/codex-ai/codex-ai
 brew install local/codex-ai/codex-ai
 ```
 
-`brew trust` est nécessaire sur les versions de Homebrew qui exigent d'approuver les formules tierces. Pour reconstruire une version locale modifiée, recopiez la formule, régénérez l'archive, puis lancez `brew fetch --force --build-from-source local/codex-ai/codex-ai` et `brew reinstall local/codex-ai/codex-ai`.
+`brew trust` is needed on Homebrew versions that require explicit approval for third-party formulas. To rebuild after local changes, copy the formula again, recreate the archive, then run `brew fetch --force --build-from-source local/codex-ai/codex-ai` and `brew reinstall local/codex-ai/codex-ai`.
 
-## Configuration et service
+## Configuring and running the service
 
-1. Lancez `codex-ai-service --help` pour créer `~/.config/cosex_ai/env` s'il n'existe pas (permissions `0600`).
-2. Générez une clé locale avec `openssl rand -hex 32`, puis renseignez `CODEX_API_KEY` dans ce fichier. Ce n'est pas une clé OpenAI. `CODEX_LISTEN` est facultatif : par défaut, le serveur écoute sur `127.0.0.1:8787`.
-3. Exécutez `codex-ai-service login`, puis ouvrez l'URL affichée pour connecter votre compte ChatGPT. Si vous devez vous reconnecter plus tard, arrêtez d'abord le service : il verrouille le cache de connexion.
-4. Démarrez le service avec `brew services start codex-ai`, sans `sudo`.
+1. Run `codex-ai-service --help` to create `~/.config/cosex_ai/env` if it does not exist (`0600` permissions).
+2. Generate a local key with `openssl rand -hex 32`, then set `CODEX_API_KEY` in that file. This is not an OpenAI API key. `CODEX_LISTEN` is optional: the server listens on `127.0.0.1:8787` by default.
+3. Run `codex-ai-service login`, then open the displayed URL to sign in to your ChatGPT account. If you need to sign in again later, stop the service first: it holds the login cache lock.
+4. Start the service with `brew services start codex-ai`, without `sudo`.
 
-L'API est accessible par défaut à `http://127.0.0.1:8787/v1`. Utilisez `CODEX_API_KEY` comme clé Bearer dans votre client. Les journaux sont dans `$(brew --prefix)/var/log/codex-ai.log`.
+By default, the API is available at `http://127.0.0.1:8787/v1`. In your client, use `CODEX_API_KEY` as the bearer token. Logs are written to `$(brew --prefix)/var/log/codex-ai.log`.
 
-Le lanceur lit le fichier `env` à chaque démarrage sans l'écraser. Écrivez une affectation par ligne (`NOM=valeur` ou `NOM='valeur avec espaces'`). Le fichier est lu comme du shell : n'y copiez que du contenu de confiance et ne le versionnez pas. Après modification, lancez `brew services restart codex-ai`. Pour arrêter le service, utilisez `brew services stop codex-ai` ; pour exécuter le serveur au premier plan, utilisez `codex-ai-service serve`.
+The launcher reads the `env` file each time it starts without overwriting it. Use one assignment per line (`NAME=value` or `NAME='value with spaces'`). The file is sourced as shell code: only put trusted content in it and keep it out of version control. After editing it, run `brew services restart codex-ai`. To stop the service, run `brew services stop codex-ai`. To run the server in the foreground, use `codex-ai-service serve`.
 
-Pour publier la formule, remplacez son URL `file://` par l'URL d'une archive de release et ajoutez son `sha256`, puis déposez la formule dans le dossier `Formula/` d'un tap Homebrew publié.
+To publish the formula, replace its `file://` URL with the URL of a release archive and add the archive's `sha256`. Then place the formula in the `Formula/` directory of a published Homebrew tap.
