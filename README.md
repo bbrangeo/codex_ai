@@ -30,7 +30,46 @@ brew test bbrangeo/codex-ai/codex-ai
 3. Stop any existing `codex_ai serve` process, then run `codex-ai-service login`. Open the displayed URL in a browser **on the same machine** and complete sign-in.
 4. Run `brew services start bbrangeo/codex-ai/codex-ai` **without `sudo`** to start the service and have it restart at login. To run in the foreground instead, use `codex-ai-service serve`.
 
-See the [Homebrew guide](homebrew/README.md) for switching from the previous GitHub tap, upgrades, and logs.
+### Switch from the previous GitHub tap
+
+If you previously added the tap from `bbrangeo/homebrew-codex-ai`, point it at this repository instead. Save any local changes to the tap first: `brew update-reset` resets that checkout. You do not need to uninstall `codex-ai`.
+
+```sh
+brew tap --custom-remote bbrangeo/codex-ai https://github.com/bbrangeo/codex_ai.git
+brew update-reset "$(brew --repository bbrangeo/codex-ai)"
+brew trust --formula bbrangeo/codex-ai/codex-ai
+brew test bbrangeo/codex-ai/codex-ai
+```
+
+### Upgrade with Homebrew
+
+```sh
+brew update
+brew upgrade bbrangeo/codex-ai/codex-ai
+brew test bbrangeo/codex-ai/codex-ai
+```
+
+Restart the service after upgrading if it was running. You do not need to sign in again while your existing OAuth session is valid.
+
+If you installed from the old `local/codex-ai` tap, stop that service if it is running and run `HOMEBREW_NO_AUTOREMOVE=1 brew uninstall local/codex-ai/codex-ai` before following the installation instructions above. This preserves your configuration and avoids removing unrelated dependencies.
+
+### Manage the Homebrew service
+
+```sh
+brew services info bbrangeo/codex-ai/codex-ai --json
+brew services restart bbrangeo/codex-ai/codex-ai
+brew services stop bbrangeo/codex-ai/codex-ai
+```
+
+The launcher reads `~/.config/cosex_ai/env` at every start without overwriting it. Use one assignment per line (`NAME=value` or `NAME='value with spaces'`). The file is sourced as shell code: keep it private and only put trusted content in it. Stop the service before running `codex-ai-service login` again: the service holds the login cache lock.
+
+To watch the service log:
+
+```sh
+tail -f "$(brew --prefix)/var/log/codex-ai.log"
+```
+
+To run in the foreground, stop the service first and run `codex-ai-service serve`.
 
 ## Getting started with Cargo (macOS, Linux, and Windows; Rust 1.89+)
 
@@ -134,7 +173,7 @@ codex_ai serve --logs debug
 
 `info` logs one line per HTTP response with the method, route, status, and elapsed time. `debug` adds request start, recognized GPT model, tool count, OAuth cache status, and Codex stream diagnostics. Logs go to `stderr`, and events for the same request share a `request` ID. In SSE mode, `http.response` marks when headers are sent, not when generation finishes. In `debug` mode, look for `codex.stream.end` or `codex.stream.error` afterward.
 
-Request logging is off unless you pass `--logs` or set `CODEX_DEBUG=1`. An explicit `--logs` overrides that variable. If you use `brew services`, add `CODEX_DEBUG=1` to the [service environment file](homebrew/README.md) and restart the service. The foreground launcher also accepts `codex-ai-service serve --logs info` or `--logs debug`.
+Request logging is off unless you pass `--logs` or set `CODEX_DEBUG=1`. An explicit `--logs` overrides that variable. If you use `brew services`, add `CODEX_DEBUG=1` to the [service environment file](#manage-the-homebrew-service) and restart the service. The foreground launcher also accepts `codex-ai-service serve --logs info` or `--logs debug`.
 
 No telemetry is sent externally. Request logs do not include full URLs, headers, keys, prompts, responses, or tool arguments.
 
@@ -164,3 +203,7 @@ To enable crates.io publishing for the first time:
 1. Use a new version rather than moving `v0.1.0`, which predates the publish metadata and the [MIT license](LICENSE).
 2. After the new version passes CI and is tagged, publish from that tagged commit with `cargo publish --locked --registry crates-io`, using a crates.io API token locally. Until this first upload, CI skips crates.io publication with a warning.
 3. In the crate's Settings → Trusted Publishing, add GitHub owner `bbrangeo`, repository `codex_ai`, and workflow filename `build.yml`. Leave the environment field blank. Future versions use a short-lived token; no GitHub secret is needed.
+
+### Update the Homebrew formula
+
+After publishing a GitHub release, update the URL in [`Formula/codex-ai.rb`](Formula/codex-ai.rb) to the new tag's source archive (`archive/refs/tags/v<VERSION>.tar.gz`). Download the archive and update `sha256` with the output of `shasum -a 256`. Push the updated formula to `master`, then [test the new version with Homebrew](#upgrade-with-homebrew).
