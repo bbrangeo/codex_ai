@@ -34,6 +34,10 @@ brew test bbrangeo/codex-ai/codex-ai
 `openssl rand -hex 32` and set `CODEX_API_KEY` in that file. You can also set
 `CODEX_LISTEN` (default: `127.0.0.1:8787`) or `CODEX_DEBUG=1`.
 
+**Set the key in this file, not just in your terminal.** On macOS, `brew services`
+starts the gateway through `launchd`, so it does not inherit an
+`export CODEX_API_KEY=...` from your current shell.
+
 Stop any existing gateway process, then run:
 
 ```sh
@@ -250,6 +254,13 @@ To watch the service log:
 ```sh
 tail -f "$(brew --prefix)/var/log/codex-ai.log"
 ```
+
+If the log says `CODEX_API_KEY is required`, check that `~/.config/cosex_ai/env`
+contains an uncommented `CODEX_API_KEY=...` assignment with your generated key,
+then restart the service with the command above. If you shared the old key,
+generate a new one and update your clients. The log retains old errors; after
+restarting, look for a new `OpenAI API: http://127.0.0.1:8787/v1` line (or your
+configured address).
 
 To run in the foreground, stop the service first and run `codex-ai-service serve`.
 
