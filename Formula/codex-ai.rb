@@ -4,6 +4,7 @@ class CodexAi < Formula
   url "https://github.com/bbrangeo/codex_ai/archive/refs/tags/v0.1.1.tar.gz"
   sha256 "9dfdf592b03bc2c625a1282a77d24dfd45b51ff96c987df9e12b4a953ea3eeef"
   license "MIT"
+  revision 1
 
   depends_on "rust" => :build
 
@@ -16,7 +17,7 @@ class CodexAi < Formula
       set -e
       umask 077
 
-      config_dir="${HOME:?HOME must be set}/.config/cosex_ai"
+      config_dir="${HOME:?HOME must be set}/.config/codex_ai"
       env_file="$config_dir/env"
       mkdir -p "$config_dir"
       if [ ! -e "$env_file" ]; then
@@ -42,7 +43,7 @@ class CodexAi < Formula
 
   def caveats
     <<~EOS
-      Run codex-ai-service --help to create ~/.config/cosex_ai/env.
+      Run codex-ai-service --help to create ~/.config/codex_ai/env.
       Set CODEX_API_KEY in that file, then run codex-ai-service login
       before starting the service without sudo.
     EOS
@@ -52,7 +53,7 @@ class CodexAi < Formula
     launcher = bin/"codex-ai-service"
     assert_match "CODEX_API_KEY", shell_output("#{launcher} --help")
 
-    config = testpath/".config/cosex_ai/env"
+    config = testpath/".config/codex_ai/env"
     assert_equal 0600, config.stat.mode & 0777
     File.write(config, <<~SH)
       CODEX_AI_BREW_TEST='loaded with spaces'

@@ -30,7 +30,7 @@ brew test bbrangeo/codex-ai/codex-ai
 `brew trust` approves only this formula. Skip that line if your Homebrew version does not have the command. `brew test` checks the launcher and its environment file in a temporary directory, without a ChatGPT account.
 
 **2. Configure and sign in.** Run `codex-ai-service --help` to create
-`~/.config/cosex_ai/env` with `0600` permissions. Generate a local key with
+`~/.config/codex_ai/env` with `0600` permissions. Generate a local key with
 `openssl rand -hex 32` and set `CODEX_API_KEY` in that file. You can also set
 `CODEX_LISTEN` (default: `127.0.0.1:8787`) or `CODEX_DEBUG=1`.
 
@@ -100,7 +100,7 @@ If you trust the contents of the file, load it in a POSIX shell:
 
 ```sh
 set -a
-. "$HOME/.config/cosex_ai/env"
+. "$HOME/.config/codex_ai/env"
 set +a
 ```
 
@@ -243,7 +243,7 @@ brew services restart bbrangeo/codex-ai/codex-ai
 brew services stop bbrangeo/codex-ai/codex-ai
 ```
 
-The launcher reads `~/.config/cosex_ai/env` at every start without overwriting it.
+The launcher reads `~/.config/codex_ai/env` at every start without overwriting it.
 Use one assignment per line (`NAME=value` or `NAME='value with spaces'`). The
 file is sourced as shell code: keep it private and only put trusted content in it.
 Stop the service before running `codex-ai-service login` again: the service holds
@@ -255,7 +255,7 @@ To watch the service log:
 tail -f "$(brew --prefix)/var/log/codex-ai.log"
 ```
 
-If the log says `CODEX_API_KEY is required`, check that `~/.config/cosex_ai/env`
+If the log says `CODEX_API_KEY is required`, check that `~/.config/codex_ai/env`
 contains an uncommented `CODEX_API_KEY=...` assignment with your generated key,
 then restart the service with the command above. If you shared the old key,
 generate a new one and update your clients. The log retains old errors; after
