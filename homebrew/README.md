@@ -2,6 +2,17 @@
 
 For first-time installation, configuration, and sign-in, see [Getting started with Homebrew](../README.md#getting-started-with-homebrew-macos).
 
+## Switch from the previous GitHub tap
+
+If you previously added the tap from `bbrangeo/homebrew-codex-ai`, point it at this repository instead. Save any local changes to the tap first: `brew update-reset` resets that checkout. No need to uninstall `codex-ai`.
+
+```sh
+brew tap --custom-remote bbrangeo/codex-ai https://github.com/bbrangeo/codex_ai.git
+brew update-reset "$(brew --repository bbrangeo/codex-ai)"
+brew trust --formula bbrangeo/codex-ai/codex-ai
+brew test bbrangeo/codex-ai/codex-ai
+```
+
 ## Upgrade
 
 ```sh
@@ -34,4 +45,4 @@ To run in the foreground, stop the service first and run `codex-ai-service serve
 
 ## Publish the formula
 
-After publishing a [GitHub release](../README.md#publishing-a-release), update the URL in [`Formula/codex-ai.rb`](Formula/codex-ai.rb) to the new tag's source archive (`archive/refs/tags/v<VERSION>.tar.gz`). Download the archive and update `sha256` with the output of `shasum -a 256`. Copy the updated formula to `Formula/codex-ai.rb` in [`bbrangeo/homebrew-codex-ai`](https://github.com/bbrangeo/homebrew-codex-ai), then verify the new version with Homebrew.
+After publishing a [GitHub release](../README.md#publishing-a-release), update the URL in [`Formula/codex-ai.rb`](../Formula/codex-ai.rb) to the new tag's source archive (`archive/refs/tags/v<VERSION>.tar.gz`). Download the archive and update `sha256` with the output of `shasum -a 256`. Push the updated formula to `master`, then verify the new version with Homebrew.

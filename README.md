@@ -14,10 +14,10 @@ This is not a local model runner, a replacement for the full OpenAI API, or a co
 
 ## Getting started with Homebrew (macOS)
 
-Install from the [public Homebrew tap](https://github.com/bbrangeo/homebrew-codex-ai). You do not need to clone this repository.
+This repository also hosts the [Homebrew formula](Formula/codex-ai.rb). Give Homebrew the repository URL when adding the tap:
 
 ```sh
-brew tap bbrangeo/codex-ai
+brew tap bbrangeo/codex-ai https://github.com/bbrangeo/codex_ai.git
 brew trust --formula bbrangeo/codex-ai/codex-ai
 brew install bbrangeo/codex-ai/codex-ai
 brew test bbrangeo/codex-ai/codex-ai
@@ -30,7 +30,7 @@ brew test bbrangeo/codex-ai/codex-ai
 3. Stop any existing `codex_ai serve` process, then run `codex-ai-service login`. Open the displayed URL in a browser **on the same machine** and complete sign-in.
 4. Run `brew services start bbrangeo/codex-ai/codex-ai` **without `sudo`** to start the service and have it restart at login. To run in the foreground instead, use `codex-ai-service serve`.
 
-See the [Homebrew guide](homebrew/README.md) for upgrades, restarts, and logs.
+See the [Homebrew guide](homebrew/README.md) for switching from the previous GitHub tap, upgrades, and logs.
 
 ## Getting started with Cargo (macOS, Linux, and Windows; Rust 1.89+)
 
