@@ -14,17 +14,13 @@ This is not a local model runner, a replacement for the full OpenAI API, or a co
 
 ## Getting started with Homebrew (macOS)
 
-From the repository root, build and test the local formula. Run `brew tap-new` only once.
+Install from the [public Homebrew tap](https://github.com/bbrangeo/homebrew-codex-ai). You do not need to clone this repository.
 
 ```sh
-brew tap-new --no-git local/codex-ai
-
-tap_dir="$(brew --repository local/codex-ai)"
-cp homebrew/Formula/codex-ai.rb "$tap_dir/Formula/"
-tar -czf "$tap_dir/codex-ai-0.1.1.tar.gz" Cargo.toml Cargo.lock LICENSE src
-brew trust --formula local/codex-ai/codex-ai
-brew install --build-from-source local/codex-ai/codex-ai
-brew test local/codex-ai/codex-ai
+brew tap bbrangeo/codex-ai
+brew trust --formula bbrangeo/codex-ai/codex-ai
+brew install bbrangeo/codex-ai/codex-ai
+brew test bbrangeo/codex-ai/codex-ai
 ```
 
 `brew trust` approves only this formula. Skip that line if your Homebrew version does not have the command. `brew test` checks the launcher and its environment file in a temporary directory, without a ChatGPT account.
@@ -32,7 +28,7 @@ brew test local/codex-ai/codex-ai
 1. Run `codex-ai-service --help` to create `~/.config/cosex_ai/env` with `0600` permissions.
 2. Generate a local key with `openssl rand -hex 32` and set `CODEX_API_KEY` in that file. You can also set `CODEX_LISTEN` (default: `127.0.0.1:8787`) or `CODEX_DEBUG=1`.
 3. Stop any existing `codex_ai serve` process, then run `codex-ai-service login`. Open the displayed URL in a browser **on the same machine** and complete sign-in.
-4. Run `brew services start local/codex-ai/codex-ai` **without `sudo`** to start the service and have it restart at login. To run in the foreground instead, use `codex-ai-service serve`.
+4. Run `brew services start bbrangeo/codex-ai/codex-ai` **without `sudo`** to start the service and have it restart at login. To run in the foreground instead, use `codex-ai-service serve`.
 
 See the [Homebrew guide](homebrew/README.md) for upgrades, restarts, and logs.
 
