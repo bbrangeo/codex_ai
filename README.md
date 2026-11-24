@@ -103,17 +103,18 @@ Replace `MODEL_ID` with an `id` from `/v1/models`. The client receives `message.
 
 If a remote client uses `stream: true` (like Cursor Agent), the tunnel must support SSE. Quick Tunnels at `trycloudflare.com` do not support SSE.
 
-## Debug mode
-
-Start the server with `CODEX_DEBUG=1` to trace requests in the terminal:
+## Request logs
 
 ```sh
-CODEX_DEBUG=1 ./target/debug/codex_ai serve
+codex_ai serve --logs info
+codex_ai serve --logs debug
 ```
 
-Diagnostic events are written to `stderr`. Events for the same request share a `request` ID, and `elapsed_ms` measures time since the request started. They report the route, HTTP status, recognized GPT model, tool count, OAuth cache status, and whether the Codex stream finished or failed. In SSE mode, `http.response` marks when headers are sent, not when generation finishes. Look for `codex.stream.end` or `codex.stream.error` afterward.
+`info` logs one line per HTTP response with the method, route, status, and elapsed time. `debug` adds request start, recognized GPT model, tool count, OAuth cache status, and Codex stream diagnostics. Logs go to `stderr`, and events for the same request share a `request` ID. In SSE mode, `http.response` marks when headers are sent, not when generation finishes. In `debug` mode, look for `codex.stream.end` or `codex.stream.error` afterward.
 
-No telemetry is sent externally. Debug mode does not log full URLs, headers, keys, prompts, responses, or tool arguments. Remove `CODEX_DEBUG=1` and restart the server to disable it. If you use `brew services`, add `CODEX_DEBUG=1` to the [service environment file](homebrew/README.md) and restart the service. Diagnostic output will appear in the usual service log.
+Request logging is off unless you pass `--logs` or set `CODEX_DEBUG=1`. An explicit `--logs` overrides that variable. If you use `brew services`, add `CODEX_DEBUG=1` to the [service environment file](homebrew/README.md) and restart the service. The foreground launcher also accepts `codex-ai-service serve --logs info` or `--logs debug`.
+
+No telemetry is sent externally. Request logs do not include full URLs, headers, keys, prompts, responses, or tool arguments.
 
 ## Cache and security
 

@@ -11,7 +11,10 @@ use anyhow::{Context as _, Result, bail, ensure};
 use reqwest::Client;
 use tokio::net::TcpListener;
 
+use crate::telemetry::LogLevel;
+
 const DEFAULT_PORT: u16 = 8787;
+const SERVE_USAGE: &str = "codex_ai serve [--logs <info|debug>]";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -24,7 +27,24 @@ async fn main() -> Result<()> {
             auth::login(&cache, &http_client()?).await?;
             println!("Signed in successfully. Tokens are saved in the private cache.");
         }
-        [arg] if arg == "serve" => serve().await?,
+        [arg, flag] if arg == "serve" && (flag == "--help" || flag == "-h") => {
+            println!("Usage: {SERVE_USAGE}");
+        }
+        [arg, options @ ..] if arg == "serve" => {
+            let log_level = match options {
+                [] if env::var_os("CODEX_DEBUG").is_some_and(|value| value == "1") => {
+                    LogLevel::Debug
+                }
+                [] => LogLevel::Off,
+                [flag, level] if flag == "--logs" => match level.to_str() {
+                    Some("info") => LogLevel::Info,
+                    Some("debug") => LogLevel::Debug,
+                    _ => bail!("--logs must be info or debug"),
+                },
+                _ => bail!("usage: {SERVE_USAGE}"),
+            };
+            serve(log_level).await?;
+        }
         [arg] if arg == "logout" => {
             auth::Cache::open()?.remove()?;
             println!("Login cache cleared.");
@@ -37,7 +57,7 @@ async fn main() -> Result<()> {
 fn help() {
     println!(
         "codex_ai login   Sign in to a ChatGPT account and cache tokens\n\
-              codex_ai serve   Start the local API (CODEX_API_KEY required, CODEX_DEBUG=1 for diagnostic logs)\n\
+              {SERVE_USAGE}  Start the local API (CODEX_API_KEY required)\n\
               codex_ai logout  Clear tokens from the local cache"
     );
 }
@@ -52,7 +72,7 @@ fn http_client() -> Result<Client> {
         .context("building the HTTP client")
 }
 
-async fn serve() -> Result<()> {
+async fn serve(log_level: LogLevel) -> Result<()> {
     let key = api::local_key(&env::var("CODEX_API_KEY").context("CODEX_API_KEY is required")?)?;
     let address: SocketAddr = match env::var("CODEX_LISTEN") {
         Ok(address) => address
@@ -67,14 +87,13 @@ async fn serve() -> Result<()> {
     );
     let client = http_client()?;
     let session = auth::Session::load(auth::Cache::open()?, client.clone())?;
-    let debug = env::var_os("CODEX_DEBUG").is_some_and(|value| value == "1");
-    let router = api::router(api::Codex::new(client, session), key, debug);
+    let router = api::router(api::Codex::new(client, session), key, log_level);
     let listener = TcpListener::bind(address)
         .await
         .context("binding the local API listener")?;
     println!("OpenAI API: http://{}/v1", listener.local_addr()?);
-    if debug {
-        eprintln!("Diagnostic logging enabled (CODEX_DEBUG=1)");
+    if log_level == LogLevel::Debug {
+        eprintln!("Diagnostic logging enabled (debug)");
     }
     axum::serve(listener, router)
         .with_graceful_shutdown(async {

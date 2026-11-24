@@ -22,7 +22,7 @@ use subtle::ConstantTimeEq as _;
 
 use crate::auth::{Credentials, ORIGINATOR, Session, SessionError};
 use crate::chat::{self, ChatStream};
-use crate::telemetry::Trace;
+use crate::telemetry::{LogLevel, Trace};
 
 const CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 // As in Zed, the catalog uses a Codex compatibility version, not the host version.
@@ -158,7 +158,7 @@ pub(super) fn local_key(value: &str) -> Result<HeaderValue> {
     Ok(key)
 }
 
-pub(super) fn router(codex: Codex, key: HeaderValue, debug: bool) -> Router {
+pub(super) fn router(codex: Codex, key: HeaderValue, log_level: LogLevel) -> Router {
     Router::new()
         .route("/v1/models", get(models))
         .route("/v1/responses", post(responses))
@@ -166,14 +166,18 @@ pub(super) fn router(codex: Codex, key: HeaderValue, debug: bool) -> Router {
         .route_layer(middleware::from_fn_with_state(key, authorize))
         .fallback(|| async { ApiError::new(StatusCode::NOT_FOUND, "not_found", "unknown route") })
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
-        .layer(middleware::from_fn_with_state(debug, trace_request))
+        .layer(middleware::from_fn_with_state(log_level, trace_request))
         .with_state(Arc::new(codex))
 }
 
-async fn trace_request(State(debug): State<bool>, mut request: Request, next: Next) -> Response {
-    let trace = Trace::start(debug);
+async fn trace_request(
+    State(log_level): State<LogLevel>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let trace = Trace::start(log_level);
     request.extensions_mut().insert(trace);
-    if !debug {
+    if log_level == LogLevel::Off {
         return next.run(request).await;
     }
     let method = match *request.method() {
@@ -183,9 +187,9 @@ async fn trace_request(State(debug): State<bool>, mut request: Request, next: Ne
         Method::OPTIONS => "OPTIONS",
         _ => "OTHER",
     };
-    let route = request
-        .extensions()
-        .get::<MatchedPath>()
+    let matched_path = request.extensions().get::<MatchedPath>().cloned();
+    let route = matched_path
+        .as_ref()
         .map_or("<unmatched>", MatchedPath::as_str);
     trace.event(format_args!("http.request method={method} route={route}"));
     let response = next.run(request).await;
@@ -193,8 +197,8 @@ async fn trace_request(State(debug): State<bool>, mut request: Request, next: Ne
         .extensions()
         .get::<ErrorCode>()
         .map_or("-", |code| code.0);
-    trace.event(format_args!(
-        "http.response status={} error={error}",
+    trace.info(format_args!(
+        "http.response method={method} route={route} status={} error={error}",
         response.status().as_u16()
     ));
     response
@@ -1010,7 +1014,7 @@ mod tests {
         let session = crate::auth::test_session(directory.path().join("private"), client.clone())?;
         let mut codex = Codex::new(client.clone(), session);
         codex.base_url = upstream;
-        let (local, local_task) = start(router(codex, local_key(KEY)?, false)).await?;
+        let (local, local_task) = start(router(codex, local_key(KEY)?, LogLevel::Off)).await?;
 
         let models_url = format!("{local}/v1/models");
         let rejected = client.get(&models_url).send().await?;
@@ -1177,7 +1181,7 @@ mod tests {
         let session = crate::auth::test_session(directory.path().join("private"), client.clone())?;
         let mut codex = Codex::new(client.clone(), session);
         codex.base_url = upstream;
-        let (local, local_task) = start(router(codex, local_key(KEY)?, true)).await?;
+        let (local, local_task) = start(router(codex, local_key(KEY)?, LogLevel::Debug)).await?;
         let url = format!("{local}/v1/chat/completions");
         let user = json!({"role": "user", "content": "What time is it in Paris?"});
         let request = |messages: Value, stream| {
