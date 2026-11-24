@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::convert::Infallible;
+use std::future::ready;
 use std::pin::pin;
 use std::sync::Arc;
 
@@ -12,7 +13,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
-use eventsource_stream::Eventsource as _;
+use eventsource_stream::{EventStreamError, Eventsource as _};
 use futures_util::{Stream, StreamExt as _};
 use reqwest::{Client, RequestBuilder};
 use serde::Deserialize;
@@ -322,21 +323,19 @@ fn normalize_request(body: &mut Value) -> Result<bool, ApiError> {
         Some(Value::Bool(stream)) => *stream,
         _ => return Err(ApiError::invalid("stream must be a boolean")),
     };
-    let mut instructions = match body.remove("instructions") {
-        None | Some(Value::Null) => String::new(),
-        Some(Value::String(value)) => value,
+    match body.get("instructions") {
+        None | Some(Value::String(_)) => {}
+        Some(Value::Null) => {
+            body.remove("instructions");
+        }
         _ => return Err(ApiError::invalid("instructions must be a string")),
-    };
+    }
     let input = match body.remove("input") {
         Some(Value::String(text)) => vec![json!({"role": "user", "content": text})],
         Some(Value::Array(input)) => input,
         _ => return Err(ApiError::invalid("input must be a string or an array")),
     };
-    body.insert(
-        "input".into(),
-        Value::Array(normalize_input(input, &mut instructions)),
-    );
-    body.insert("instructions".into(), Value::String(instructions));
+    body.insert("input".into(), Value::Array(normalize_input(input)));
     body.remove("conversation");
     body.remove("previous_response_id");
     body.remove("background");
@@ -345,8 +344,9 @@ fn normalize_request(body: &mut Value) -> Result<bool, ApiError> {
     Ok(stream)
 }
 
-fn normalize_input(input: Vec<Value>, instructions: &mut String) -> Vec<Value> {
+fn normalize_input(input: Vec<Value>) -> Vec<Value> {
     let mut normalized = Vec::with_capacity(input.len());
+    let mut initial_system = Vec::new();
     for mut item in input {
         if matches!(item["type"].as_str(), None | Some("message"))
             && let Some(role @ ("system" | "developer" | "user" | "assistant")) =
@@ -354,17 +354,12 @@ fn normalize_input(input: Vec<Value>, instructions: &mut String) -> Vec<Value> {
         {
             let system = role == "system";
             let assistant = role == "assistant";
-            // Codex rejects system-role items. Follow Zed: initial system text goes into
-            // instructions; later updates stay in place with the developer role.
             if system
                 && normalized.is_empty()
                 && let Some(text) = system_text(&item["content"])
             {
                 if !text.trim().is_empty() {
-                    if !instructions.is_empty() {
-                        instructions.push_str("\n\n");
-                    }
-                    instructions.push_str(&text);
+                    initial_system.push(text);
                 }
                 continue;
             }
@@ -383,6 +378,17 @@ fn normalize_input(input: Vec<Value>, instructions: &mut String) -> Vec<Value> {
             }
         }
         normalized.push(item);
+    }
+    // Match Zed: keep the reusable system prompt in the cacheable prefix,
+    // before any replayed compaction item, without moving later updates.
+    if !initial_system.is_empty() {
+        normalized.insert(
+            0,
+            json!({
+                "type": "message", "role": "developer",
+                "content": [{"type": "input_text", "text": initial_system.join("\n\n")}]
+            }),
+        );
     }
     normalized
 }
@@ -426,11 +432,8 @@ fn events(
             let response = upstream.json::<Value>().await.map_err(|error| {
                 if error.is_timeout() { error.into() } else { format_error() }
             })?;
-            if !response["error"].is_null() || response["status"] == "failed" {
+            if !response["error"].is_null() || response["status"] == "failed" || !response["detail"].is_null() {
                 Err(ApiError::stream_failure(&response))?;
-            }
-            if let Some(message) = response["detail"].as_str() {
-                Err(ApiError::gateway(message))?;
             }
             if !response["output"].is_array() {
                 Err(format_error())?;
@@ -447,7 +450,7 @@ fn events(
                 seen = true;
                 yield event?;
             }
-            if !seen {
+            if !seen && content_type != "text/event-stream" {
                 Err(format_error())?;
             }
         }
@@ -514,16 +517,19 @@ fn sse_events(upstream: reqwest::Response) -> impl Stream<Item = Result<Value, A
     upstream
         .bytes_stream()
         .eventsource()
+        // A terminator closes the stream, but only a Responses final event is success.
+        .take_while(|event| ready(!matches!(event, Ok(event) if event.data == "[DONE]")))
         .filter_map(|event| async move {
             let event = match event {
                 Ok(event) => event,
+                Err(EventStreamError::Transport(error)) => return Some(Err(error.into())),
                 Err(_) => {
                     return Some(Err(ApiError::gateway(
                         "Codex SSE stream was interrupted or invalid",
                     )));
                 }
             };
-            if event.data == "[DONE]" || event.data.is_empty() {
+            if event.data.is_empty() {
                 return None;
             }
             let decoded = serde_json::from_str::<Value>(&event.data)
@@ -631,7 +637,7 @@ fn stream_response(upstream: reqwest::Response, mut output: Output, trace: Trace
         let data = match output {
             Output::Responses => {
                 frame = frame.event("error");
-                json!({"type": "error", "message": error.message, "code": error.code, "param": null})
+                json!({"type": "error", "message": error.message, "code": error.payload_code(), "param": null})
             }
             Output::Chat(_) => error.payload(),
         };
@@ -645,7 +651,27 @@ fn stream_response(upstream: reqwest::Response, mut output: Output, trace: Trace
 struct ApiError {
     status: StatusCode,
     code: &'static str,
+    // Upstream data goes in responses, not diagnostic logs.
+    provider_code: Option<String>,
     message: String,
+}
+
+fn provider_error(payload: &Value) -> &Value {
+    [
+        &payload["response"]["error"],
+        &payload["error"],
+        &payload["detail"],
+    ]
+    .into_iter()
+    .find(|error| error.is_object())
+    .unwrap_or(payload)
+}
+
+fn provider_discriminator(error: &Value) -> Option<&str> {
+    ["code", "type"]
+        .into_iter()
+        .filter_map(|key| error[key].as_str())
+        .find(|code| !code.trim().is_empty() && !terminal_failure(code))
 }
 
 impl ApiError {
@@ -653,6 +679,7 @@ impl ApiError {
         Self {
             status,
             code,
+            provider_code: None,
             message: message.into(),
         }
     }
@@ -674,42 +701,60 @@ impl ApiError {
                 "Codex rejected the session; stop the server and run `codex_ai login` again",
             );
         }
-        let message = if status.is_client_error() && status != StatusCode::FORBIDDEN {
-            response.json::<Value>().await.ok().and_then(|body| {
-                body["error"]["message"]
-                    .as_str()
-                    .or_else(|| body["detail"].as_str())
-                    .map(str::to_owned)
-            })
-        } else {
-            None
-        };
-        let message = message.unwrap_or_else(|| format!("Codex returned HTTP {status}"));
-        if status.is_client_error() {
-            Self::new(status, "codex_request_rejected", message)
-        } else {
-            Self::gateway(message)
+        let message = format!("Codex returned HTTP {status}");
+        if !status.is_client_error() {
+            return Self::gateway(message);
         }
+        let mut error = Self::new(status, "codex_request_rejected", message);
+        if status != StatusCode::FORBIDDEN
+            && let Ok(body) = response.json::<Value>().await
+        {
+            let provider = provider_error(&body);
+            error.provider_code = provider_discriminator(provider).map(str::to_owned);
+            if let Some(message) = provider["message"]
+                .as_str()
+                .or_else(|| body["detail"].as_str())
+            {
+                error.message = message.to_owned();
+            }
+        }
+        error
     }
 
     fn stream_failure(event: &Value) -> Self {
-        Self::gateway(
-            event["response"]["error"]["message"]
-                .as_str()
-                .or_else(|| event["error"]["message"].as_str())
-                .or_else(|| event["message"].as_str())
-                .unwrap_or("Codex generation failed"),
-        )
+        let provider = provider_error(event);
+        let code = provider_discriminator(provider);
+        let status = match code {
+            Some("usage_limit_reached" | "insufficient_quota") => StatusCode::PAYMENT_REQUIRED,
+            Some("rate_limit_exceeded" | "rate_limit_error") => StatusCode::TOO_MANY_REQUESTS,
+            Some("context_length_exceeded" | "request_too_large" | "invalid_encrypted_content") => {
+                StatusCode::BAD_REQUEST
+            }
+            _ => StatusCode::BAD_GATEWAY,
+        };
+        let message = provider["message"]
+            .as_str()
+            .or_else(|| event["message"].as_str())
+            .or_else(|| event["detail"].as_str())
+            .unwrap_or("Codex generation failed");
+        let mut error = Self::new(status, "upstream_error", message);
+        error.provider_code = code.map(str::to_owned);
+        error
+    }
+
+    fn payload_code(&self) -> &str {
+        self.provider_code.as_deref().unwrap_or(self.code)
     }
 
     fn payload(&self) -> Value {
         let kind = match self.status {
             StatusCode::UNAUTHORIZED => "authentication_error",
+            StatusCode::PAYMENT_REQUIRED => "payment_required_error",
             StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
             s if s.is_client_error() => "invalid_request_error",
             _ => "server_error",
         };
-        json!({"error": {"message": self.message, "type": kind, "param": null, "code": self.code}})
+        json!({"error": {"message": self.message, "type": kind, "param": null, "code": self.payload_code()}})
     }
 }
 
@@ -790,22 +835,36 @@ mod tests {
 
     #[test]
     fn normalizes_system_instructions_for_codex() {
+        let compaction = json!({"type": "compaction", "encrypted_content": "opaque"});
+        let reasoning =
+            json!({"type": "reasoning", "id": "rs_test", "encrypted_content": "opaque"});
+        let call = json!({"type": "function_call", "call_id": "call_test", "name": "example", "arguments": "{}"});
+        let result =
+            json!({"type": "function_call_output", "call_id": "call_test", "output": "42"});
         let mut request = json!({"model": "mock-model", "instructions": "Base", "input": [
             {"role": "system", "content": "Initial"},
-            {"role": "user", "content": "Question"},
-            {"role": "system", "content": "Updated"},
-            {"type": "compaction", "encrypted_content": "opaque"}
+            {"role": "system", "content": [{"type": "input_text", "text": "More"}]},
+            compaction, {"role": "user", "content": "Question"},
+            {"role": "system", "content": "Updated"}, reasoning, call, result
         ]});
         assert!(matches!(normalize_request(&mut request), Ok(false)));
-        assert_eq!(request["instructions"], "Base\n\nInitial");
-        assert_eq!(request["input"][0]["content"][0]["type"], "input_text");
-        assert_eq!(request["input"][1]["role"], "developer");
+        assert_eq!(request["instructions"], "Base");
         assert_eq!(
-            request["input"][2],
-            json!({"type": "compaction", "encrypted_content": "opaque"})
+            request["input"],
+            json!([
+                {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "Initial\n\nMore"}]},
+                compaction,
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Question"}]},
+                {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "Updated"}]},
+                reasoning, call, result
+            ])
         );
         assert_eq!(request["store"], false);
         assert_eq!(request["stream"], true);
+
+        let mut request = json!({"model": "mock-model", "input": "Hello"});
+        assert!(normalize_request(&mut request).is_ok());
+        assert!(request.get("instructions").is_none());
     }
 
     async fn start(app: Router) -> Result<(String, JoinHandle<std::io::Result<()>>)> {
@@ -813,6 +872,96 @@ mod tests {
         let url = format!("http://{}", listener.local_addr()?);
         let task = tokio::spawn(async move { axum::serve(listener, app).await });
         Ok((url, task))
+    }
+
+    #[tokio::test]
+    async fn preserves_provider_error_codes_in_json_and_chat_streams() -> Result<()> {
+        let event = json!({"type": "response.failed", "response": {"error": {
+            "code": "usage_limit_reached", "message": "Quota exhausted"
+        }}});
+        let mock = Router::new()
+            .route("/stream", get(move || async move {
+                ([(header::CONTENT_TYPE, "text/event-stream")], format!("data: {event}\n\n"))
+            }))
+            .route("/rejected", get(|| async {
+                (StatusCode::TOO_MANY_REQUESTS, Json(json!({"error": {
+                    "type": "rate_limit_error", "code": "rate_limit_exceeded", "message": "Slow down"
+                }})))
+            }));
+        let (base, task) = start(mock).await?;
+        let client = Client::builder().no_proxy().build()?;
+        let request = || client.get(format!("{base}/stream")).send();
+        let error = collect_response(request().await?, Trace::default())
+            .await
+            .err()
+            .context("expected a quota error")?;
+        assert_eq!(error.status, StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(error.payload()["error"]["code"], "usage_limit_reached");
+
+        let (_, options) = chat::into_responses(json!({
+            "model": "mock-model", "messages": [{"role": "user", "content": "Test"}], "stream": true
+        }))
+        .map_err(anyhow::Error::msg)?;
+        let response = stream_response(
+            request().await?,
+            Output::Chat(ChatStream::new(options)),
+            Trace::default(),
+        );
+        let body = axum::body::to_bytes(response.into_body(), 4096).await?;
+        let body = std::str::from_utf8(&body)?;
+        assert!(body.contains("\"code\":\"usage_limit_reached\""));
+        assert!(!body.contains("[DONE]"));
+
+        let error =
+            ApiError::from_upstream(client.get(format!("{base}/rejected")).send().await?).await;
+        assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(error.payload()["error"]["code"], "rate_limit_exceeded");
+        task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn distinguishes_sse_terminator_without_final_response_from_timeout() -> Result<()> {
+        let mock = Router::new().route(
+            "/{case}",
+            get(
+                |axum::extract::Path(case): axum::extract::Path<String>| async move {
+                    let frames = if case == "done" {
+                        "data: {\"type\":\"response.created\"}\n\ndata: [DONE]\n\n"
+                    } else {
+                        "data: {\"type\":\"response.created\"}\n\n"
+                    };
+                    let stream =
+                        futures_util::stream::once(async move { Ok::<_, Infallible>(frames) })
+                            .chain(futures_util::stream::pending());
+                    (
+                        [(header::CONTENT_TYPE, "text/event-stream")],
+                        axum::body::Body::from_stream(stream),
+                    )
+                },
+            ),
+        );
+        let (base, task) = start(mock).await?;
+        let client = Client::builder()
+            .no_proxy()
+            .read_timeout(std::time::Duration::from_secs(1))
+            .build()?;
+        let request = |case| client.get(format!("{base}/{case}")).send();
+        let error = collect_response(request("done").await?, Trace::default())
+            .await
+            .err()
+            .context("[DONE] alone must not succeed")?;
+        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(error.code, "upstream_error");
+
+        let error = collect_response(request("timeout").await?, Trace::default())
+            .await
+            .err()
+            .context("expected an upstream read timeout")?;
+        assert_eq!(error.status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(error.code, "upstream_timeout");
+        task.abort();
+        Ok(())
     }
 
     #[tokio::test]
