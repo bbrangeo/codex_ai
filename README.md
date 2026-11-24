@@ -202,13 +202,20 @@ If a remote client uses `stream: true` (like Cursor Agent), the tunnel must supp
 ## Request logs
 
 ```sh
+# Homebrew (foreground, with the service environment loaded)
+codex-ai-service serve --logs info
+codex-ai-service serve --logs debug
+
+# Cargo (installed binary)
 codex_ai serve --logs info
 codex_ai serve --logs debug
 ```
 
+If you export `CODEX_API_KEY` yourself, you can run the Homebrew binary directly with `codex-ai serve --logs info` (or `debug`). From a Cargo checkout, use `cargo run --locked -- serve --logs info` (or `debug`).
+
 `info` logs one line per HTTP response with the method, route, status, and elapsed time. `debug` adds request start, recognized GPT model, tool count, OAuth cache status, and Codex stream diagnostics. Logs go to `stderr`, and events for the same request share a `request` ID. In SSE mode, `http.response` marks when headers are sent, not when generation finishes. In `debug` mode, look for `codex.stream.end` or `codex.stream.error` afterward.
 
-Request logging is off unless you pass `--logs` or set `CODEX_DEBUG=1`. An explicit `--logs` overrides that variable. If you use `brew services`, add `CODEX_DEBUG=1` to the [service environment file](#manage-the-homebrew-service) and restart the service. The foreground launcher also accepts `codex-ai-service serve --logs info` or `--logs debug`.
+Request logging is off unless you pass `--logs` or set `CODEX_DEBUG=1`. An explicit `--logs` overrides that variable. If you use `brew services`, add `CODEX_DEBUG=1` to the [service environment file](#manage-the-homebrew-service) and restart the service.
 
 No telemetry is sent externally. Request logs do not include full URLs, headers, keys, prompts, responses, or tool arguments.
 
