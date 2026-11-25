@@ -21,7 +21,7 @@ fn masks_model_fields_that_are_not_short_gpt_ids() {
     }
 }
 
-async fn start(app: Router) -> Result<(String, JoinHandle<std::io::Result<()>>)> {
+pub(super) async fn start(app: Router) -> Result<(String, JoinHandle<std::io::Result<()>>)> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let url = format!("http://{}", listener.local_addr()?);
     let task = tokio::spawn(async move { axum::serve(listener, app).await });
@@ -551,13 +551,15 @@ async fn translates_chat_tool_calls_over_http() -> Result<()> {
         ChatTools::FunctionsOnly,
     ))
     .await?;
-    let catalog_status = client
+    let fallback = client
         .get(format!("{local}/v1/models"))
         .bearer_auth(KEY)
         .send()
-        .await?
-        .status();
-    assert_eq!(catalog_status, StatusCode::NOT_FOUND);
+        .await?;
+    assert_eq!(fallback.status(), StatusCode::OK);
+    let fallback: Value = fallback.json().await?;
+    assert_eq!(fallback["data"][0]["id"], "gpt-5.6-sol");
+    assert_eq!(fallback["data"][0]["x_codex"], json!({}));
     let url = format!("{local}/v1/chat/completions");
     let user = json!({"role": "user", "content": "What time is it in Paris?"});
 

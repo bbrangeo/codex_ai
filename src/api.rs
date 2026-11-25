@@ -34,7 +34,7 @@ pub(super) struct Codex {
     client: Client,
     session: Arc<Session>,
     base_url: String,
-    catalog: Mutex<Option<CachedCatalog>>,
+    catalog: Mutex<CachedCatalog>,
 }
 
 impl Codex {
@@ -43,7 +43,7 @@ impl Codex {
             client,
             session: Arc::new(session),
             base_url: CODEX_BASE_URL.into(),
-            catalog: Mutex::new(None),
+            catalog: Mutex::default(),
         }
     }
 
@@ -89,7 +89,7 @@ impl Codex {
     }
 
     async fn start_response(
-        &self,
+        self: &Arc<Self>,
         body: &mut Value,
         stream: bool,
         fallback_effort: Option<&str>,
@@ -252,8 +252,8 @@ async fn authorize(State(key): State<HeaderValue>, request: Request, next: Next)
 async fn models(
     State(codex): State<Arc<Codex>>,
     Extension(trace): Extension<Trace>,
-) -> Result<Json<Value>, ApiError> {
-    Ok(Json(codex.catalog(trace).await?.listing()))
+) -> Json<Value> {
+    Json(codex.model_listing(trace).await)
 }
 
 async fn responses(

@@ -151,7 +151,7 @@ curl -fsS http://127.0.0.1:8787/v1/chat/completions \
 
 | Endpoint | Behavior |
 | --- | --- |
-| `GET /v1/models` | Lists models visible in your Codex account's catalog. |
+| `GET /v1/models` | Lists models visible in your Codex account's catalog, or a built-in fallback list if no catalog could be loaded. |
 | `POST /v1/responses` | Generates responses as JSON or SSE (`stream: true`). Native Responses items and tools are forwarded to Codex, subject to backend support. |
 | `POST /v1/chat/completions` | Returns text, `function` tool calls, and usage as JSON or SSE. For images and other tool types, use Responses. |
 
@@ -182,8 +182,13 @@ Both generation endpoints return `400` for a `reasoning.effort` or `service_tier
 that the model catalog does not support. Use `priority` for Fast and `ultrafast`
 for Ultrafast. If no effort is specified, the gateway uses the model's catalog
 default when available. The catalog is shared with `/v1/models` and cached for
-five minutes; if it is unavailable, a model is not listed in it, or the relevant
-metadata is missing, the gateway leaves that model-specific validation to Codex.
+five minutes. The first request after expiry triggers a single background
+refresh and uses the last successful catalog, even if the refresh fails.
+The initial load waits up to five seconds while the background fetch can take
+up to one minute. Until a catalog is loaded, `/v1/models` can return a built-in
+list without capability metadata or a guarantee of account access. If no
+catalog is available, a model is absent, or the relevant metadata is missing,
+the gateway leaves that model-specific validation to Codex.
 
 Chat Completions also accepts `reasoning` as an effort string (`"high"`). An
 explicit effort in `reasoning` takes precedence over `reasoning_effort`.
