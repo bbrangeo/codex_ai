@@ -1,10 +1,9 @@
 class CodexAi < Formula
   desc "Codex AI service"
   homepage "https://github.com/bbrangeo/codex_ai"
-  url "https://github.com/bbrangeo/codex_ai/archive/refs/tags/v0.1.1.tar.gz"
-  sha256 "9dfdf592b03bc2c625a1282a77d24dfd45b51ff96c987df9e12b4a953ea3eeef"
+  url "https://github.com/bbrangeo/codex_ai/archive/refs/tags/v0.1.2.tar.gz"
+  sha256 "45371461ef6bfe5281281ff3514646a49defc71d59184f150a9913cb0c17adc5"
   license "MIT"
-  revision 1
 
   depends_on "rust" => :build
 
