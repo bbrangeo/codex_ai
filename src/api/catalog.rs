@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use tokio::sync::watch;
 use tokio::time::{Instant, timeout};
 
-use super::{ApiError, Codex};
+use super::{ApiError, Codex, UpstreamResponse};
 use crate::telemetry::Trace;
 
 // As in Zed, this is a Codex compatibility version, not the host version.
@@ -207,7 +207,10 @@ impl Codex {
 
     async fn fetch_catalog(&self, trace: Trace) -> Result<Catalog, ApiError> {
         let url = format!("{}/models", self.base_url);
-        let response = self
+        let UpstreamResponse {
+            response,
+            permit: _permit,
+        } = self
             .send(trace, || {
                 self.client
                     .get(&url)
@@ -302,6 +305,7 @@ fn check_option<'a>(
 mod tests {
     use anyhow::{Context as _, Result};
     use axum::http::StatusCode;
+    use axum::response::{IntoResponse as _, Response};
     use axum::routing::get;
     use axum::{Json, Router};
     use reqwest::Client;
@@ -316,7 +320,7 @@ mod tests {
         let mock = Router::new().route(
             "/models",
             get(move || async move {
-                let (respond, response) = oneshot::channel::<(StatusCode, Json<Value>)>();
+                let (respond, response) = oneshot::channel::<Response>();
                 requested
                     .send(respond)
                     .expect("test is listening for requests");
@@ -327,12 +331,18 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let client = Client::builder().no_proxy().build()?;
         let session = crate::auth::test_session(directory.path().join("private"), client.clone())?;
-        let mut codex = Codex::new(client, session);
+        let mut codex = Codex::new(client, session, 4);
         codex.base_url = upstream;
         let codex = Arc::new(codex);
         let models = || codex.model_listing(Trace::default());
         let limit = Duration::from_secs(2);
-        let unavailable = || (StatusCode::SERVICE_UNAVAILABLE, Json(json!({})));
+        let unavailable = || {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::RETRY_AFTER, "60")],
+            )
+                .into_response()
+        };
         let listing = |slug| {
             (
                 StatusCode::OK,
@@ -340,6 +350,7 @@ mod tests {
                     {"slug": slug, "visibility": "list", "priority": 0, "context_window": 128_000}
                 ]})),
             )
+                .into_response()
         };
 
         let (fallback, concurrent, reply) = tokio::join!(models(), models(), async {

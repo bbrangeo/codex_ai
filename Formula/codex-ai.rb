@@ -24,6 +24,7 @@ class CodexAi < Formula
           '# Generate a CODEX_API_KEY value with openssl rand -hex 32' \
           '# CODEX_API_KEY=' \
           '# CODEX_LISTEN=127.0.0.1:8787' \
+          '# CODEX_MAX_CONCURRENCY=4' \
           'CODEX_CHAT_FUNCTION_TOOLS_ONLY=1' > "$env_file")
       fi
 
@@ -55,6 +56,7 @@ class CodexAi < Formula
 
     config = testpath/".config/codex_ai/env"
     assert_equal 0600, config.stat.mode & 0777
+    assert_match(/^# CODEX_MAX_CONCURRENCY=4$/, config.read)
     assert_match(/^CODEX_CHAT_FUNCTION_TOOLS_ONLY=1$/, config.read)
     File.write(config, <<~SH)
       CODEX_AI_BREW_TEST='loaded with spaces'

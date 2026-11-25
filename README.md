@@ -171,6 +171,16 @@ curl -fsS http://127.0.0.1:8787/v1/chat/completions \
 This is not a local model runner, a replacement for the full OpenAI API, or a
 coding agent that edits files or executes your client's tools.
 
+Set `CODEX_MAX_CONCURRENCY` to a positive integer to limit simultaneous Codex
+requests per gateway process (default: `4`). Extra requests wait for a slot;
+streaming responses keep their slot until the stream ends or the client
+disconnects. The model catalog shares this limit.
+
+Before responding to the client, the gateway retries upstream HTTP `429` and
+`5xx` at most twice, after 250 ms and 500 ms or a longer `Retry-After` delay.
+If `Retry-After` calls for more than 10 seconds of waiting, the gateway returns
+the error with that header instead. It never restarts an SSE stream.
+
 - **The client owns the conversation.** The gateway does not keep conversation state and sends `store: false` to Codex. Include the relevant history in `input` (Responses) or `messages` (Chat Completions) on each turn. Stored responses, `previous_response_id`, server-side conversations, and background mode are not supported.
 - **The client runs its own functions.** The gateway returns function calls and translates the results your client sends back; it does not execute those functions. For multi-turn tool workflows, prefer Responses and replay any opaque reasoning items alongside tool calls and results.
 - **Compatibility is limited to the endpoints above.** Embeddings are not supported, and not every OpenAI parameter is accepted. Supported options can vary by model. Chat Completions is limited to text and `function` tools; use Responses for features such as image input or other tool types where Codex supports them.

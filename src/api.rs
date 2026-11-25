@@ -4,6 +4,7 @@ mod stream;
 mod tests;
 
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context as _, Result, ensure};
 use axum::extract::rejection::JsonRejection;
@@ -19,7 +20,7 @@ use codex_ai::responses::normalize_request;
 use reqwest::{Client, RequestBuilder};
 use serde_json::{Value, json};
 use subtle::ConstantTimeEq as _;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 use self::catalog::CachedCatalog;
 use self::stream::{Output, collect_response, stream_response, terminal_failure};
@@ -29,21 +30,30 @@ use crate::telemetry::{LogLevel, Trace};
 const CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 
 const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
+const RETRY_BACKOFF: [Duration; 2] = [Duration::from_millis(250), Duration::from_millis(500)];
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(10);
 
 pub(super) struct Codex {
     client: Client,
     session: Arc<Session>,
     base_url: String,
     catalog: Mutex<CachedCatalog>,
+    concurrency: Arc<Semaphore>,
+}
+
+struct UpstreamResponse {
+    response: reqwest::Response,
+    permit: OwnedSemaphorePermit,
 }
 
 impl Codex {
-    pub(super) fn new(client: Client, session: Session) -> Self {
+    pub(super) fn new(client: Client, session: Session, max_concurrency: usize) -> Self {
         Self {
             client,
             session: Arc::new(session),
             base_url: CODEX_BASE_URL.into(),
             catalog: Mutex::default(),
+            concurrency: Arc::new(Semaphore::new(max_concurrency)),
         }
     }
 
@@ -51,7 +61,11 @@ impl Codex {
         &self,
         trace: Trace,
         build: impl Fn() -> RequestBuilder,
-    ) -> Result<reqwest::Response, ApiError> {
+    ) -> Result<UpstreamResponse, ApiError> {
+        let permit = Arc::clone(&self.concurrency)
+            .acquire_owned()
+            .await
+            .expect("the Codex semaphore is never closed");
         let send = |credentials: &Credentials, attempt: u8| {
             let request = upstream_request(build(), credentials);
             async move {
@@ -74,17 +88,43 @@ impl Codex {
                     })
             }
         };
-        let credentials = self.session.credentials(None, trace).await?;
-        let mut response = send(&credentials, 1).await?;
-        if response.status() == StatusCode::UNAUTHORIZED {
-            drop(response);
-            let credentials = self.session.credentials(Some(&credentials), trace).await?;
-            response = send(&credentials, 2).await?;
-        }
-        if response.status().is_success() {
-            Ok(response)
-        } else {
-            Err(ApiError::from_upstream(response).await)
+        let mut credentials = self.session.credentials(None, trace).await?;
+        let mut refreshed = false;
+        let mut backoffs = RETRY_BACKOFF.into_iter();
+        let mut attempt = 1;
+        loop {
+            let response = send(&credentials, attempt).await?;
+            let status = response.status();
+            if status.is_success() {
+                return Ok(UpstreamResponse { response, permit });
+            }
+            if status == StatusCode::UNAUTHORIZED && !refreshed {
+                drop(response);
+                credentials = self.session.credentials(Some(&credentials), trace).await?;
+                refreshed = true;
+            } else if retryable_status(status)
+                && let Some(backoff) = backoffs.next()
+            {
+                let delay = response
+                    .headers()
+                    .get(header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| retry_after(value, SystemTime::now()))
+                    .map_or(backoff, |delay| delay.max(backoff));
+                // Long cooldowns are returned to the client rather than retried early.
+                if delay > MAX_RETRY_DELAY {
+                    return Err(ApiError::from_upstream(response).await);
+                }
+                drop(response);
+                trace.event(format_args!(
+                    "codex.http.retry attempt={attempt} status={status} delay_ms={}",
+                    delay.as_millis()
+                ));
+                tokio::time::sleep(delay).await;
+            } else {
+                return Err(ApiError::from_upstream(response).await);
+            }
+            attempt += 1;
         }
     }
 
@@ -94,7 +134,7 @@ impl Codex {
         stream: bool,
         fallback_effort: Option<&str>,
         trace: Trace,
-    ) -> Result<reqwest::Response, ApiError> {
+    ) -> Result<UpstreamResponse, ApiError> {
         self.apply_model_options(body, fallback_effort, trace)
             .await?;
         trace.event(format_args!(
@@ -121,6 +161,19 @@ impl Codex {
         })
         .await
     }
+}
+
+fn retryable_status(status: StatusCode) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+fn retry_after(value: &str, now: SystemTime) -> Option<Duration> {
+    let value = value.trim();
+    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Some(Duration::from_secs(value.parse().unwrap_or(u64::MAX)));
+    }
+    let date = httpdate::parse_http_date(value).ok()?;
+    Some(date.duration_since(now).unwrap_or_default())
 }
 
 fn model_for_debug(value: &Value) -> &str {
@@ -353,6 +406,7 @@ struct ApiError {
     // Upstream data goes in responses, not diagnostic logs.
     provider_code: Option<String>,
     message: String,
+    retry_after: Option<HeaderValue>,
 }
 
 fn provider_error(payload: &Value) -> &Value {
@@ -380,6 +434,7 @@ impl ApiError {
             code,
             provider_code: None,
             message: message.into(),
+            retry_after: None,
         }
     }
 
@@ -401,11 +456,16 @@ impl ApiError {
             );
         }
         let message = format!("Codex returned HTTP {status}");
-        if !status.is_client_error() {
-            return Self::gateway(message);
+        let mut error = if status.is_client_error() {
+            Self::new(status, "codex_request_rejected", message)
+        } else {
+            Self::gateway(message)
+        };
+        if retryable_status(status) {
+            error.retry_after = response.headers().get(header::RETRY_AFTER).cloned();
         }
-        let mut error = Self::new(status, "codex_request_rejected", message);
-        if status != StatusCode::FORBIDDEN
+        if status.is_client_error()
+            && status != StatusCode::FORBIDDEN
             && let Ok(body) = response.json::<Value>().await
         {
             let provider = provider_error(&body);
@@ -508,12 +568,18 @@ struct ErrorCode(&'static str);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (
+        let mut response = (
             self.status,
             [(header::CACHE_CONTROL, "no-store")],
             Extension(ErrorCode(self.code)),
             Json(self.payload()),
         )
-            .into_response()
+            .into_response();
+        if let Some(retry_after) = self.retry_after {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, retry_after);
+        }
+        response
     }
 }

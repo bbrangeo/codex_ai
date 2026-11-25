@@ -10,10 +10,12 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, bail, ensure};
 use reqwest::Client;
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 
 use crate::telemetry::LogLevel;
 
 const DEFAULT_PORT: u16 = 8787;
+const DEFAULT_MAX_CONCURRENCY: usize = 4;
 const SERVE_USAGE: &str = "serve [--logs <info|debug>]";
 
 #[tokio::main]
@@ -92,6 +94,18 @@ async fn serve(log_level: LogLevel) -> Result<()> {
         address.ip().is_loopback(),
         "CODEX_LISTEN must use a loopback address"
     );
+    let max_concurrency = match env::var("CODEX_MAX_CONCURRENCY") {
+        Ok(value) => value
+            .parse::<usize>()
+            .context("CODEX_MAX_CONCURRENCY must be a positive integer")?,
+        Err(env::VarError::NotPresent) => DEFAULT_MAX_CONCURRENCY,
+        Err(error) => return Err(error).context("invalid CODEX_MAX_CONCURRENCY"),
+    };
+    ensure!(
+        (1..=Semaphore::MAX_PERMITS).contains(&max_concurrency),
+        "CODEX_MAX_CONCURRENCY must be between 1 and {}",
+        Semaphore::MAX_PERMITS
+    );
     let client = http_client()?;
     let session = auth::Session::load(auth::Cache::open()?, client.clone())?;
     let chat_tools =
@@ -100,7 +114,12 @@ async fn serve(log_level: LogLevel) -> Result<()> {
         } else {
             api::ChatTools::Strict
         };
-    let router = api::router(api::Codex::new(client, session), key, log_level, chat_tools);
+    let router = api::router(
+        api::Codex::new(client, session, max_concurrency),
+        key,
+        log_level,
+        chat_tools,
+    );
     let listener = TcpListener::bind(address)
         .await
         .context("binding the local API listener")?;

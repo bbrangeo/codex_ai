@@ -13,7 +13,7 @@ use eventsource_stream::{EventStreamError, Eventsource as _};
 use futures_util::{Stream, StreamExt as _};
 use serde_json::{Value, json};
 
-use super::ApiError;
+use super::{ApiError, UpstreamResponse};
 use crate::telemetry::Trace;
 
 // Keep the original payload for native Responses clients, including fields we don't interpret.
@@ -26,11 +26,12 @@ enum ResponseEvent {
 const MISSING_FINAL_RESPONSE: &str = "Codex stream ended without a final response";
 
 fn events(
-    upstream: reqwest::Response,
+    upstream: UpstreamResponse,
     trace: Trace,
 ) -> impl Stream<Item = Result<ResponseEvent, ApiError>> {
     async_stream::try_stream! {
-        let mut upstream = pin!(decode_response(upstream, trace));
+        let UpstreamResponse { response, permit: _permit } = upstream;
+        let mut upstream = pin!(decode_response(response, trace));
         let mut items = BTreeMap::new();
         let mut pending_compactions = BTreeSet::new();
         while let Some(event) = upstream.next().await {
@@ -219,7 +220,7 @@ pub(super) fn terminal_failure(kind: &str) -> bool {
 }
 
 pub(super) async fn collect_response(
-    upstream: reqwest::Response,
+    upstream: UpstreamResponse,
     trace: Trace,
 ) -> Result<Value, ApiError> {
     let mut events = pin!(events(upstream, trace));
@@ -239,7 +240,7 @@ pub(super) enum Output {
 }
 
 pub(super) fn stream_response(
-    upstream: reqwest::Response,
+    upstream: UpstreamResponse,
     mut output: Output,
     trace: Trace,
 ) -> Response {

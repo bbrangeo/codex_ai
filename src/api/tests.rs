@@ -4,7 +4,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use axum::http::HeaderMap;
 use futures_util::StreamExt as _;
 use tokio::net::TcpListener;
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
+use tokio::time::{Instant, timeout};
 
 use super::*;
 
@@ -28,6 +30,113 @@ pub(super) async fn start(app: Router) -> Result<(String, JoinHandle<std::io::Re
     Ok((url, task))
 }
 
+fn with_test_permit(response: reqwest::Response) -> UpstreamResponse {
+    let permit = Arc::new(Semaphore::new(1))
+        .try_acquire_owned()
+        .expect("a new semaphore has one permit");
+    UpstreamResponse { response, permit }
+}
+
+#[test]
+fn parses_retry_after_seconds_and_http_dates() {
+    let date = "Wed, 21 Oct 2015 07:28:00 GMT";
+    let now = httpdate::parse_http_date(date).expect("valid HTTP date") - Duration::from_secs(7);
+    assert_eq!(retry_after(date, now), Some(Duration::from_secs(7)));
+    assert_eq!(retry_after(" 12 ", now), Some(Duration::from_secs(12)));
+    assert_eq!(
+        retry_after(date, now + Duration::from_secs(8)),
+        Some(Duration::ZERO)
+    );
+    assert_eq!(
+        retry_after("18446744073709551616", now),
+        Some(Duration::from_secs(u64::MAX))
+    );
+    assert_eq!(retry_after("invalid", now), None);
+}
+
+#[tokio::test]
+async fn retries_before_streaming_and_keeps_the_slot_until_the_stream_ends() -> Result<()> {
+    const KEY: &str = "only-for-the-local-mocked-api-test";
+    let calls = Arc::new(AtomicUsize::new(0));
+    let finish_stream = Arc::new(Notify::new());
+    let upstream_calls = Arc::clone(&calls);
+    let finish = Arc::clone(&finish_stream);
+    let mock = Router::new()
+        .route("/models", get(|| async { Json(json!({"models": []})) }))
+        .route("/responses", post(move || async move {
+            match upstream_calls.fetch_add(1, Ordering::Relaxed) {
+                0 => (StatusCode::TOO_MANY_REQUESTS, [(header::RETRY_AFTER, "1")]).into_response(),
+                1 => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                2 => {
+                    let stream = async_stream::stream! {
+                        yield Ok::<_, Infallible>("data: {\"type\":\"response.created\"}\n\n");
+                        finish.notified().await;
+                        yield Ok::<_, Infallible>("data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"rate_limit_exceeded\"}}}\n\n");
+                    };
+                    ([(header::CONTENT_TYPE, "text/event-stream")], axum::body::Body::from_stream(stream)).into_response()
+                }
+                _ => (StatusCode::TOO_MANY_REQUESTS, [(header::RETRY_AFTER, "60")]).into_response(),
+            }
+        }));
+    let (upstream, upstream_task) = start(mock).await?;
+    let directory = tempfile::tempdir()?;
+    let client = Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    let session = crate::auth::test_session(directory.path().join("private"), client.clone())?;
+    let mut codex = Codex::new(client.clone(), session, 1);
+    codex.base_url = upstream;
+    let (local, local_task) = start(router(
+        codex,
+        local_key(KEY)?,
+        LogLevel::Off,
+        ChatTools::Strict,
+    ))
+    .await?;
+    let request = |stream| {
+        client
+            .post(format!("{local}/v1/responses"))
+            .bearer_auth(KEY)
+            .json(&json!({
+                "model": "mock-model", "input": "Hello", "stream": stream
+            }))
+            .send()
+    };
+
+    let started = Instant::now();
+    let mut first = request(true).await?.error_for_status()?;
+    assert!(started.elapsed() >= Duration::from_millis(1500));
+    let chunk = first
+        .chunk()
+        .await?
+        .context("expected the first SSE frame")?;
+    assert!(std::str::from_utf8(&chunk)?.contains("response.created"));
+    assert_eq!(calls.load(Ordering::Relaxed), 3);
+
+    let mut second = std::pin::pin!(request(false));
+    assert!(
+        timeout(Duration::from_millis(100), second.as_mut())
+            .await
+            .is_err(),
+        "a second request must wait for the stream's slot"
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), 3);
+    finish_stream.notify_one();
+    assert!(first.text().await?.contains("event: response.failed"));
+    let second = second.await?;
+    assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(second.headers()[header::RETRY_AFTER], "60");
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        4,
+        "no retries for the SSE failure or the long cooldown"
+    );
+    local_task.abort();
+    upstream_task.abort();
+    Ok(())
+}
+
 #[tokio::test]
 async fn preserves_provider_error_codes_in_json_and_chat_streams() -> Result<()> {
     let event = json!({"type": "response.failed", "response": {"error": {
@@ -44,7 +153,13 @@ async fn preserves_provider_error_codes_in_json_and_chat_streams() -> Result<()>
         }));
     let (base, task) = start(mock).await?;
     let client = Client::builder().no_proxy().build()?;
-    let request = || client.get(format!("{base}/stream")).send();
+    let request = || async {
+        client
+            .get(format!("{base}/stream"))
+            .send()
+            .await
+            .map(with_test_permit)
+    };
     let error = collect_response(request().await?, Trace::default())
         .await
         .err()
@@ -96,7 +211,13 @@ async fn requires_a_finished_compaction_before_a_successful_response() -> Result
     );
     let (base, task) = start(mock).await?;
     let client = Client::builder().no_proxy().build()?;
-    let request = |case| client.get(format!("{base}/{case}")).send();
+    let request = async |case: &str| {
+        client
+            .get(format!("{base}/{case}"))
+            .send()
+            .await
+            .map(with_test_permit)
+    };
 
     let incomplete = collect_response(request("missing").await?, Trace::default()).await;
     let error = incomplete
@@ -151,7 +272,13 @@ async fn distinguishes_sse_terminator_without_final_response_from_timeout() -> R
         .no_proxy()
         .read_timeout(std::time::Duration::from_secs(1))
         .build()?;
-    let request = |case| client.get(format!("{base}/{case}")).send();
+    let request = async |case: &str| {
+        client
+            .get(format!("{base}/{case}"))
+            .send()
+            .await
+            .map(with_test_permit)
+    };
     let error = collect_response(request("done").await?, Trace::default())
         .await
         .err()
@@ -249,7 +376,7 @@ async fn serves_openai_formats_with_local_auth_and_codex_upstream() -> Result<()
         .timeout(std::time::Duration::from_secs(5))
         .build()?;
     let session = crate::auth::test_session(directory.path().join("private"), client.clone())?;
-    let mut codex = Codex::new(client.clone(), session);
+    let mut codex = Codex::new(client.clone(), session, 4);
     codex.base_url = upstream;
     let (local, local_task) = start(router(
         codex,
@@ -542,7 +669,7 @@ async fn translates_chat_tool_calls_over_http() -> Result<()> {
         .timeout(std::time::Duration::from_secs(5))
         .build()?;
     let session = crate::auth::test_session(directory.path().join("private"), client.clone())?;
-    let mut codex = Codex::new(client.clone(), session);
+    let mut codex = Codex::new(client.clone(), session, 4);
     codex.base_url = upstream;
     let (local, local_task) = start(router(
         codex,
