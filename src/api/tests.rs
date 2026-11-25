@@ -1,7 +1,6 @@
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use axum::http::HeaderMap;
 use futures_util::StreamExt as _;
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
@@ -211,9 +210,15 @@ async fn retries_before_streaming_and_keeps_the_slot_until_the_stream_ends() -> 
                         finish.notified().await;
                         yield Ok::<_, Infallible>("data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"rate_limit_exceeded\"}}}\n\n");
                     };
-                    ([(header::CONTENT_TYPE, "text/event-stream")], axum::body::Body::from_stream(stream)).into_response()
+                    ([
+                        (header::CONTENT_TYPE, "text/event-stream"),
+                        (axum::http::HeaderName::from_static("x-codex-primary-used-percent"), "20"),
+                    ], axum::body::Body::from_stream(stream)).into_response()
                 }
-                _ => (StatusCode::TOO_MANY_REQUESTS, [(header::RETRY_AFTER, "60")]).into_response(),
+                _ => (StatusCode::TOO_MANY_REQUESTS, [
+                    (header::RETRY_AFTER, "60"),
+                    (axum::http::HeaderName::from_static("x-codex-primary-used-percent"), "100"),
+                ]).into_response(),
             }
         }));
     let (upstream, upstream_task) = start(mock).await?;
@@ -244,6 +249,7 @@ async fn retries_before_streaming_and_keeps_the_slot_until_the_stream_ends() -> 
 
     let started = Instant::now();
     let mut first = request(true).await?.error_for_status()?;
+    assert_eq!(first.headers()["x-codex-primary-used-percent"], "20");
     assert!(started.elapsed() >= Duration::from_millis(1500));
     let chunk = first
         .chunk()
@@ -265,6 +271,7 @@ async fn retries_before_streaming_and_keeps_the_slot_until_the_stream_ends() -> 
     let second = second.await?;
     assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(second.headers()[header::RETRY_AFTER], "60");
+    assert_eq!(second.headers()["x-codex-primary-used-percent"], "100");
     assert_eq!(
         calls.load(Ordering::Relaxed),
         4,
@@ -300,12 +307,16 @@ async fn compacts_responses_with_the_native_codex_endpoint() -> Result<()> {
                 assert_eq!(headers["chatgpt-account-id"], "test-account");
                 assert_eq!(headers[header::ACCEPT], "application/json");
                 if body["model"] == "mock-invalid-output" {
-                    return Json(json!({"output": null}));
+                    return Json(json!({"output": null})).into_response();
                 }
                 assert_eq!(headers["session-id"], "test-session");
                 assert_eq!(headers["thread-id"], "test-session");
                 assert_eq!(body, expected);
-                Json(upstream_output)
+                (
+                    [("x-codex-secondary-used-percent", "30")],
+                    Json(upstream_output),
+                )
+                    .into_response()
             },
         ),
     );
@@ -365,6 +376,7 @@ async fn compacts_responses_with_the_native_codex_endpoint() -> Result<()> {
         .error_for_status()?;
     assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
     assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    assert_eq!(response.headers()["x-codex-secondary-used-percent"], "30");
     assert_eq!(response.json::<Value>().await?, compacted);
 
     let invalid = client
@@ -609,7 +621,10 @@ async fn serves_openai_formats_with_local_auth_and_codex_upstream() -> Result<()
             ]});
             let summary = json!({"id": "resp_test", "model": body["model"], "created_at": 1, "object": "response", "status": "completed", "output": [item], "usage": {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3}});
             if body["model"] == "mock-json" {
-                return Json(summary).into_response();
+                return ([
+                    ("x-codex-primary-used-percent", "40"), ("x-codex-turn-state", "opaque"),
+                    ("x-metered-primary-used-percent", "35"), ("x-metered-secondary-reset-at", "1704069000"),
+                ], Json(summary)).into_response();
             }
             if body["model"] == "mock-html" {
                 return ([(header::CONTENT_TYPE, "text/html")], "<html>do not forward</html>").into_response();
@@ -782,6 +797,15 @@ async fn serves_openai_formats_with_local_auth_and_codex_upstream() -> Result<()
             StatusCode::OK,
             "upstream format for {model}"
         );
+        if model == "mock-json" {
+            assert_eq!(response.headers()["x-codex-primary-used-percent"], "40");
+            assert_eq!(response.headers()["x-metered-primary-used-percent"], "35");
+            assert_eq!(
+                response.headers()["x-metered-secondary-reset-at"],
+                "1704069000"
+            );
+            assert!(!response.headers().contains_key("x-codex-turn-state"));
+        }
         let chat: Value = response.json().await?;
         assert_eq!(chat["choices"][0]["message"]["content"], "Hi");
         let chunks = request(model, true)
@@ -916,10 +940,23 @@ async fn translates_chat_tool_calls_over_http() -> Result<()> {
                     json!({"effort": "high", "summary": "auto"})
                 );
                 assert_eq!(body["input"][0]["role"], "user");
+                assert_eq!(body["input"][0]["content"][1], json!({
+                    "type": "input_image", "image_url": "data:image/png;base64,YQ==", "detail": "low"
+                }));
                 assert_eq!(body["service_tier"], "ultrafast");
+                let legacy = body["parallel_tool_calls"] == false;
+                if legacy {
+                    assert_eq!(body["tool_choice"], json!({"type": "function", "name": NAME}));
+                }
                 let mut events = vec![json!({"type": "response.created", "response": {
                     "id": "resp_tools", "model": body["model"], "created_at": 1
                 }})];
+                let reasoning = json!({"type": "reasoning", "id": "rs_time", "summary": [
+                    {"type": "summary_text", "text": "Checking the time"}
+                ]});
+                events.push(json!({"type": "response.reasoning_summary_text.delta", "item_id": "rs_time",
+                    "summary_index": 0, "delta": "Checking the time"}));
+                events.push(json!({"type": "response.output_item.done", "output_index": 1, "item": reasoning}));
                 let item = if body["input"].as_array().map(Vec::len) == Some(1) {
                     let mut item = json!({"type": "function_call", "id": ITEM_ID,
                         "call_id": CALL_ID, "name": NAME, "arguments": ""});
@@ -936,6 +973,9 @@ async fn translates_chat_tool_calls_over_http() -> Result<()> {
                     let call = &body["input"][1];
                     assert_eq!(call["type"], "function_call");
                     assert!(call["call_id"].as_str().is_some_and(|id| id.len() <= 64));
+                    if legacy {
+                        assert_eq!(call["call_id"], "call_legacy_1");
+                    }
                     assert_eq!(call["name"], NAME);
                     assert_eq!(call["arguments"], ARGUMENT_DELTAS.concat());
                     let output = &body["input"][2];
@@ -951,7 +991,7 @@ async fn translates_chat_tool_calls_over_http() -> Result<()> {
                 }));
                 events.push(json!({"type": "response.completed", "response": {
                     "id": "resp_tools", "model": body["model"], "created_at": 1,
-                    "object": "response", "status": "completed", "output": [item]
+                    "object": "response", "status": "completed", "output": [item, reasoning]
                 }}));
                 let stream: String = events
                     .iter()
@@ -987,7 +1027,10 @@ async fn translates_chat_tool_calls_over_http() -> Result<()> {
     assert_eq!(fallback["data"][0]["id"], "gpt-5.6-sol");
     assert_eq!(fallback["data"][0]["x_codex"], json!({}));
     let url = format!("{local}/v1/chat/completions");
-    let user = json!({"role": "user", "content": "What time is it in Paris?"});
+    let user = json!({"role": "user", "content": [
+        {"type": "text", "text": "What time is it in Paris?"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,YQ==", "detail": "low"}}
+    ]});
 
     let request = |messages: Value, stream| {
         client.post(&url).bearer_auth(KEY).json(&json!({
@@ -1043,6 +1086,7 @@ async fn translates_chat_tool_calls_over_http() -> Result<()> {
     assert_eq!(choice["finish_reason"], "tool_calls");
     let message = &choice["message"];
     assert_eq!(message["role"], "assistant");
+    assert_eq!(message["reasoning_content"], "Checking the time");
     assert_eq!(
         message["tool_calls"],
         json!([{"id": CALL_ID, "type": "function",
@@ -1066,6 +1110,57 @@ async fn translates_chat_tool_calls_over_http() -> Result<()> {
     .await?;
     assert_eq!(follow_up["choices"][0]["message"]["content"], ANSWER);
     assert_eq!(follow_up["choices"][0]["finish_reason"], "stop");
+
+    let legacy = |messages: Value, stream| {
+        client.post(&url).bearer_auth(KEY).json(&json!({
+            "model": "mock-model", "messages": messages, "stream": stream,
+            "functions": [{"name": NAME, "parameters": parameters}], "function_call": {"name": NAME},
+            "reasoning": {"effort": "high", "summary": "auto"}, "service_tier": "ultrafast"
+        }))
+    };
+    let response: Value = legacy(json!([user]), false)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let choice = &response["choices"][0];
+    assert_eq!(choice["finish_reason"], "function_call");
+    let message = &choice["message"];
+    assert_eq!(
+        message["function_call"],
+        json!({"name": NAME, "arguments": arguments})
+    );
+    assert!(message.get("tool_calls").is_none());
+    let streamed = legacy(json!([user]), true)
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    assert!(streamed.contains("\"finish_reason\":\"function_call\""));
+    assert!(!streamed.contains("\"tool_calls\""));
+    let deltas = streamed
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|data| *data != "[DONE]")
+        .map(serde_json::from_str::<Value>)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let arguments = deltas
+        .iter()
+        .filter_map(|chunk| chunk["choices"][0]["delta"]["function_call"]["arguments"].as_str())
+        .collect::<String>();
+    assert_eq!(arguments, ARGUMENT_DELTAS.concat());
+    let response: Value = legacy(
+        json!([user, message, {"role": "function", "name": NAME, "content": TOOL_OUTPUT}]),
+        false,
+    )
+    .send()
+    .await?
+    .error_for_status()?
+    .json()
+    .await?;
+    assert_eq!(response["choices"][0]["message"]["content"], ANSWER);
     local_task.abort();
     upstream_task.abort();
     Ok(())

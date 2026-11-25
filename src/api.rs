@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime};
 use anyhow::{Context as _, Result, ensure};
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, MatchedPath, Path, Request, State};
-use axum::http::{HeaderValue, Method, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -173,6 +173,47 @@ impl Codex {
         })
         .await
     }
+}
+
+fn quota_headers(headers: &HeaderMap) -> HeaderMap {
+    headers
+        .iter()
+        .filter(|(name, _)| {
+            let name = name.as_str();
+            if name.starts_with("x-ratelimit-")
+                || matches!(
+                    name,
+                    "x-codex-credits-has-credits"
+                        | "x-codex-credits-unlimited"
+                        | "x-codex-credits-balance"
+                        | "x-codex-rate-limit-reached-type"
+                )
+            {
+                return true;
+            }
+            // Codex CLI discovers metered families by x-<limit>-primary-used-percent.
+            const PRIMARY_USAGE: &str = "-primary-used-percent";
+            name.starts_with("x-")
+                && [
+                    PRIMARY_USAGE,
+                    "-primary-window-minutes",
+                    "-primary-reset-at",
+                    "-secondary-used-percent",
+                    "-secondary-window-minutes",
+                    "-secondary-reset-at",
+                    "-limit-name",
+                ]
+                .into_iter()
+                .any(|suffix| {
+                    name.strip_suffix(suffix).is_some_and(|prefix| {
+                        prefix == "x-codex"
+                            || suffix == PRIMARY_USAGE
+                            || headers.contains_key(format!("{prefix}{PRIMARY_USAGE}"))
+                    })
+                })
+        })
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect()
 }
 
 fn retryable_status(status: StatusCode) -> bool {
@@ -356,7 +397,8 @@ async fn responses(
     if stream {
         Ok(stream_response(upstream, Output::Responses, trace))
     } else {
-        Ok(Json(collect_response(upstream, trace).await?).into_response())
+        let headers = quota_headers(upstream.response.headers());
+        Ok((headers, collect_response(upstream, trace).await.map(Json)).into_response())
     }
 }
 
@@ -364,7 +406,7 @@ async fn compact_responses(
     State(codex): State<Arc<Codex>>,
     Extension(trace): Extension<Trace>,
     body: Result<Json<Value>, JsonRejection>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Response, ApiError> {
     let mut body = body?.0;
     normalize_compact_request(&mut body)?;
     let UpstreamResponse {
@@ -373,13 +415,20 @@ async fn compact_responses(
     } = codex
         .post_responses("responses/compact", "application/json", &body, trace)
         .await?;
-    let compacted: Value = response.json().await?;
-    if !compacted["output"].is_array() {
-        return Err(ApiError::gateway(
-            "Codex compaction response is missing an output array",
-        ));
-    }
-    Ok(Json(compacted))
+    let headers = quota_headers(response.headers());
+    let compacted = response
+        .json::<Value>()
+        .await
+        .map_err(ApiError::from)
+        .and_then(|compacted| {
+            if !compacted["output"].is_array() {
+                return Err(ApiError::gateway(
+                    "Codex compaction response is missing an output array",
+                ));
+            }
+            Ok(Json(compacted))
+        });
+    Ok((headers, compacted).into_response())
 }
 
 async fn chat_completions(
@@ -415,8 +464,11 @@ async fn chat_completions(
             trace,
         ))
     } else {
-        let response = collect_response(upstream, trace).await?;
-        Ok(Json(chat::completion(&response, options.model())).into_response())
+        let headers = quota_headers(upstream.response.headers());
+        let response = collect_response(upstream, trace)
+            .await
+            .map(|value| Json(options.completion(&value)));
+        Ok((headers, response).into_response())
     }
 }
 
@@ -487,7 +539,7 @@ struct ApiError {
     // Upstream data goes in responses, not diagnostic logs.
     provider_code: Option<String>,
     message: String,
-    retry_after: Option<HeaderValue>,
+    headers: Option<Box<HeaderMap>>,
 }
 
 fn provider_error(payload: &Value) -> &Value {
@@ -515,7 +567,7 @@ impl ApiError {
             code,
             provider_code: None,
             message: message.into(),
-            retry_after: None,
+            headers: None,
         }
     }
 
@@ -529,24 +581,27 @@ impl ApiError {
 
     async fn from_upstream(response: reqwest::Response) -> Self {
         let status = response.status();
-        if status == StatusCode::UNAUTHORIZED {
-            return Self::new(
+        let message = format!("Codex returned HTTP {status}");
+        let mut error = match status {
+            StatusCode::UNAUTHORIZED => Self::new(
                 StatusCode::BAD_GATEWAY,
                 "codex_authentication_failed",
                 "Codex rejected the session; run `codex_ai login` again",
-            );
-        }
-        let message = format!("Codex returned HTTP {status}");
-        let mut error = if status.is_client_error() {
-            Self::new(status, "codex_request_rejected", message)
-        } else {
-            Self::gateway(message)
+            ),
+            status if status.is_client_error() => {
+                Self::new(status, "codex_request_rejected", message)
+            }
+            _ => Self::gateway(message),
         };
-        if retryable_status(status) {
-            error.retry_after = response.headers().get(header::RETRY_AFTER).cloned();
+        let mut headers = quota_headers(response.headers());
+        if retryable_status(status)
+            && let Some(value) = response.headers().get(header::RETRY_AFTER)
+        {
+            headers.insert(header::RETRY_AFTER, value.clone());
         }
+        error.headers = (!headers.is_empty()).then(|| Box::new(headers));
         if status.is_client_error()
-            && status != StatusCode::FORBIDDEN
+            && !matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
             && let Ok(body) = response.json::<Value>().await
         {
             let provider = provider_error(&body);
@@ -656,10 +711,8 @@ impl IntoResponse for ApiError {
             Json(self.payload()),
         )
             .into_response();
-        if let Some(retry_after) = self.retry_after {
-            response
-                .headers_mut()
-                .insert(header::RETRY_AFTER, retry_after);
+        if let Some(headers) = self.headers {
+            response.headers_mut().extend(*headers);
         }
         response
     }

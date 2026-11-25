@@ -203,7 +203,7 @@ curl -fsS http://127.0.0.1:8787/v1/chat/completions \
 | `GET /v1/models/{id}` | Requires the gateway API key. Returns one model from the same catalog or fallback as `GET /v1/models`, or `404` if the ID is not found. |
 | `POST /v1/responses` | Generates responses as JSON or SSE (`stream: true`). Native Responses items and tools are forwarded to Codex, subject to backend support. |
 | `POST /v1/responses/compact` | Compacts the supplied history with Codex. Returns JSON only. |
-| `POST /v1/chat/completions` | Returns text, `function` tool calls, and usage as JSON or SSE. For images and other tool types, use Responses. |
+| `POST /v1/chat/completions` | Accepts text and image input; returns text, reasoning summaries when available, `function` tool calls, and usage as JSON or SSE. |
 
 To compact a conversation, send `model` and the current history as `input` to
 `/v1/responses/compact`. Use the returned `output` as the new history for
@@ -236,10 +236,14 @@ Before responding to the client, the gateway retries upstream HTTP `429` and
 `5xx` at most twice, after 250 ms and 500 ms or a longer `Retry-After` delay.
 If `Retry-After` calls for more than 10 seconds of waiting, the gateway returns
 the error with that header instead. It never restarts an SSE stream.
+When Codex supplies quota headers, the gateway forwards them on generation and
+compaction responses (including upstream errors). These include the window and
+credit headers read by Codex CLI, such as `x-codex-primary-used-percent` and
+`x-codex-primary-reset-at`.
 
 - **The client owns the conversation.** The gateway does not keep conversation state and sends `store: false` to Codex. Include the relevant history in `input` (Responses) or `messages` (Chat Completions) on each turn. Stored responses, `previous_response_id`, server-side conversations, and background mode are not supported.
 - **The client runs its own functions.** The gateway returns function calls and translates the results your client sends back; it does not execute those functions. For multi-turn tool workflows, prefer Responses and replay any opaque reasoning items alongside tool calls and results.
-- **Compatibility is limited to the endpoints above.** Embeddings are not supported, and not every OpenAI parameter is accepted. Supported options can vary by model. Chat Completions is limited to text and `function` tools; use Responses for features such as image input or other tool types where Codex supports them.
+- **Compatibility is limited to the endpoints above.** Embeddings are not supported, and not every OpenAI parameter is accepted. Supported options can vary by model. Chat Completions accepts `image_url` parts in user messages (URLs or base64 data URLs) on models that support vision. Use Responses for tool types other than `function`.
 - **The upstream is ChatGPT Codex, not `api.openai.com`.** The backend may change independently of the public OpenAI API. It does not accept `safety_identifier`, so the gateway omits it, including when derived from Chat Completions `user`.
 
 Leading `system` messages are sent to Codex as one leading `developer` message so their text can be part of the cached prefix. An explicit Responses `instructions` field is forwarded separately. Tool call IDs over Codex's 64-character limit are shortened consistently for calls and their matching results before forwarding.
@@ -266,7 +270,9 @@ Chat Completions also accepts `reasoning` as an effort string (`"high"`). An
 explicit effort in `reasoning` takes precedence over `reasoning_effort`.
 Boolean `true` requests the catalog default, or `medium` if there is no default
 and `medium` is not known to be unsupported. Boolean `false` supplies no effort
-override; it does not disable reasoning.
+override; it does not disable reasoning. Use `"reasoning": {"summary": "auto"}`
+to request a summary. When Codex provides one, Chat exposes it as
+`message.reasoning_content` (JSON) or `delta.reasoning_content` (SSE).
 
 ### Testing a Chat Completions tool call
 
@@ -297,7 +303,7 @@ curl -fsS http://127.0.0.1:8787/v1/chat/completions \
 
 </details>
 
-Replace `MODEL_ID` with an `id` from `/v1/models`. The client receives `message.tool_calls`, runs the function, and sends the history back with the `assistant` message followed by a `tool` message whose `tool_call_id` matches the call's `id`. The gateway does not run the function. Legacy Chat `function_call` calls and `custom` tools are not supported on this endpoint.
+Replace `MODEL_ID` with an `id` from `/v1/models`. The client receives `message.tool_calls`, runs the function, and sends the history back with the `assistant` message followed by a `tool` message whose `tool_call_id` matches the call's `id`. The gateway does not run the function. Clients using legacy `functions` or `function_call` receive one call at a time as `function_call` and send the result back as a `role: "function"` message with the same `name`. `custom` tools are not supported on this endpoint.
 
 ### Troubleshooting Cursor through Cloudflare Tunnel
 

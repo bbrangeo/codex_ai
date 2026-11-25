@@ -13,7 +13,7 @@ use eventsource_stream::{EventStreamError, Eventsource as _};
 use futures_util::{Stream, StreamExt as _};
 use serde_json::{Value, json};
 
-use super::{ApiError, UpstreamResponse};
+use super::{ApiError, UpstreamResponse, quota_headers};
 use crate::telemetry::Trace;
 
 // Keep the original payload for native Responses clients, including fields we don't interpret.
@@ -244,6 +244,7 @@ pub(super) fn stream_response(
     mut output: Output,
     trace: Trace,
 ) -> Response {
+    let headers = quota_headers(upstream.response.headers());
     let stream = async_stream::stream! {
         let mut events = pin!(events(upstream, trace));
         let error = loop {
@@ -288,7 +289,5 @@ pub(super) fn stream_response(
         };
         yield Ok(frame.data(data.to_string()));
     };
-    Sse::new(stream)
-        .keep_alive(KeepAlive::default())
-        .into_response()
+    (headers, Sse::new(stream).keep_alive(KeepAlive::default())).into_response()
 }

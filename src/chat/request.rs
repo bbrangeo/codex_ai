@@ -11,6 +11,7 @@ pub struct ChatOptions {
     pub(super) model: String,
     pub(super) stream: bool,
     pub(super) include_usage: bool,
+    pub(super) legacy_functions: bool,
 }
 
 impl ChatOptions {
@@ -75,9 +76,18 @@ fn convert(body: Value) -> Result<(Value, ChatOptions), String> {
     if messages.is_empty() {
         return Err("messages must be a non-empty array".into());
     }
+    let has_option = |key| body.get(key).is_some_and(|value| !value.is_null());
+    for (legacy, modern) in [("functions", "tools"), ("function_call", "tool_choice")] {
+        if has_option(legacy) && has_option(modern) {
+            return Err(format!("use either {legacy} or {modern}, not both"));
+        }
+    }
+    let legacy_functions = has_option("functions") || has_option("function_call");
     let mut input = Vec::with_capacity(messages.len());
+    let mut pending_function = None;
     for (index, message) in messages.into_iter().enumerate() {
-        append_input(message, &mut input).map_err(|error| format!("messages[{index}]: {error}"))?;
+        append_input(message, &mut input, &mut pending_function)
+            .map_err(|error| format!("messages[{index}]: {error}"))?;
     }
     let mut request = json!({"model": model, "input": input});
     let mut text = Map::new();
@@ -112,25 +122,36 @@ fn convert(body: Value) -> Result<(Value, ChatOptions), String> {
             "top_logprobs" if value.as_u64() == Some(0) => {}
             "logit_bias" if value.as_object().is_some_and(Map::is_empty) => {}
             "stop" if value.as_array().is_some_and(Vec::is_empty) => {}
-            "tools" => {
+            "tools" | "functions" => {
                 let Value::Array(tools) = value else {
-                    return Err("tools must be an array".into());
+                    return Err(format!("{key} must be an array"));
                 };
                 if !tools.is_empty() {
+                    let convert = if key == "functions" {
+                        function_definition
+                    } else {
+                        tool_definition
+                    };
                     request["tools"] = Value::Array(
                         tools
                             .into_iter()
-                            .map(tool_definition)
+                            .map(convert)
                             .collect::<Result<Vec<_>, _>>()?,
                     );
                 }
             }
             "tool_choice" => request["tool_choice"] = tool_choice(&value)?,
+            "function_call" => {
+                request["tool_choice"] = if matches!(value.as_str(), Some("none" | "auto")) {
+                    value
+                } else if let Some(name) = nonempty(&value["name"]) {
+                    json!({"type": "function", "name": name})
+                } else {
+                    return Err("function_call must be none, auto, or a named function".into());
+                };
+            }
             "parallel_tool_calls" if value.is_boolean() => request[key] = value,
             "parallel_tool_calls" => return Err("parallel_tool_calls must be a boolean".into()),
-            "functions" | "function_call" => {
-                return Err("legacy functions are not supported; use tools and tool_choice".into());
-            }
             "user" if value.is_string() => {
                 if request.get("safety_identifier").is_none() {
                     request["safety_identifier"] = value;
@@ -158,7 +179,12 @@ fn convert(body: Value) -> Result<(Value, ChatOptions), String> {
     if !text.is_empty() {
         request["text"] = Value::Object(text);
     }
-    if request.get("tools").is_some() && request.get("parallel_tool_calls").is_none() {
+    if legacy_functions {
+        if request["parallel_tool_calls"] == true {
+            return Err("legacy function_call does not support parallel tool calls".into());
+        }
+        request["parallel_tool_calls"] = Value::Bool(false);
+    } else if request.get("tools").is_some() && request.get("parallel_tool_calls").is_none() {
         request["parallel_tool_calls"] = Value::Bool(true);
     }
     Ok((
@@ -167,6 +193,7 @@ fn convert(body: Value) -> Result<(Value, ChatOptions), String> {
             model,
             stream,
             include_usage,
+            legacy_functions,
         },
     ))
 }
@@ -204,19 +231,35 @@ fn reasoning_config(
     Ok(reasoning)
 }
 
-fn append_input(message: Value, input: &mut Vec<Value>) -> Result<(), String> {
+fn append_input(
+    message: Value,
+    input: &mut Vec<Value>,
+    pending_function: &mut Option<usize>,
+) -> Result<(), String> {
     let Value::Object(mut message) = message else {
         return Err("each message must be an object".into());
     };
+    let previous_function = pending_function.take();
     let role = message.remove("role");
     let role = match role.as_ref().and_then(Value::as_str) {
         Some(role @ ("system" | "developer" | "user" | "assistant" | "tool")) => role,
+        Some("function") => {
+            let call = previous_function
+                .and_then(|index| input.get(index))
+                .filter(|call| message.get("name") == call.get("name"))
+                .ok_or(
+                    "function messages must follow an assistant function_call with the same name",
+                )?;
+            message.insert("tool_call_id".into(), call["call_id"].clone());
+            "tool"
+        }
         _ => return Err("unsupported message role".into()),
     };
     let content = message.remove("content").unwrap_or_default();
     let tool_call_id = (role == "tool").then(|| message.remove("tool_call_id").unwrap_or_default());
     let mut calls = Vec::new();
     let mut refusal = Value::Null;
+    let mut legacy_call = None;
     if role == "assistant" {
         calls = match message.remove("tool_calls") {
             None | Some(Value::Null) => Vec::new(),
@@ -224,6 +267,19 @@ fn append_input(message: Value, input: &mut Vec<Value>) -> Result<(), String> {
             _ => return Err("assistant tool_calls must be an array".into()),
         };
         refusal = message.remove("refusal").unwrap_or_default();
+        legacy_call = message
+            .remove("function_call")
+            .filter(|call| !call.is_null());
+        if legacy_call.is_some() && !calls.is_empty() {
+            return Err("assistant messages cannot mix function_call and tool_calls".into());
+        }
+        // A display summary from an earlier turn is not a replayable Responses reasoning item.
+        if let Some(summary) = message.remove("reasoning_content")
+            && !summary.is_null()
+            && !summary.is_string()
+        {
+            return Err("reasoning_content must be a string".into());
+        }
     }
     // Responses messages have no place for Chat participant names or Cursor history IDs.
     for field in ["name", "modelProviderMessageId"] {
@@ -244,22 +300,23 @@ fn append_input(message: Value, input: &mut Vec<Value>) -> Result<(), String> {
         let output = if content.is_string() {
             content
         } else {
-            Value::Array(text_parts(content, role)?)
+            Value::Array(content_parts(content, role)?)
         };
         input.push(json!({"type": "function_call_output", "call_id": id, "output": output}));
         return Ok(());
     }
-    if content.is_null() && calls.is_empty() && refusal.is_null() {
+    let has_calls = !calls.is_empty() || legacy_call.is_some();
+    if content.is_null() && !has_calls && refusal.is_null() {
         return Err(
             "message content is required unless the assistant has tool calls or a refusal".into(),
         );
     }
     let mut content = if content.is_null()
-        || (!calls.is_empty() && content.as_str().is_some_and(|s| s.trim().is_empty()))
+        || (has_calls && content.as_str().is_some_and(|s| s.trim().is_empty()))
     {
         Vec::new()
     } else {
-        text_parts(content, role)?
+        content_parts(content, role)?
     };
     if let Value::String(refusal) = refusal {
         content.push(json!({"type": "refusal", "refusal": refusal}));
@@ -268,6 +325,11 @@ fn append_input(message: Value, input: &mut Vec<Value>) -> Result<(), String> {
     }
     if !content.is_empty() {
         input.push(json!({"type": "message", "role": role, "content": content}));
+    }
+    if let Some(function) = legacy_call {
+        // Legacy Chat does not carry an ID, so derive one from the position in the history.
+        *pending_function = Some(input.len());
+        calls.push(json!({"type": "function", "id": format!("call_legacy_{}", input.len()), "function": function}));
     }
     for call in calls {
         if call["type"] != "function"
@@ -284,7 +346,7 @@ fn append_input(message: Value, input: &mut Vec<Value>) -> Result<(), String> {
     Ok(())
 }
 
-fn text_parts(content: Value, role: &str) -> Result<Vec<Value>, &'static str> {
+fn content_parts(content: Value, role: &str) -> Result<Vec<Value>, &'static str> {
     let part = |text: Value| {
         if role == "assistant" {
             json!({"type": "output_text", "text": text, "annotations": []})
@@ -304,18 +366,37 @@ fn text_parts(content: Value, role: &str) -> Result<Vec<Value>, &'static str> {
                 {
                     return Ok(part(text));
                 }
-                Err("only text message parts are supported")
+                if role == "user" && value["type"] == "image_url" {
+                    return image_part(&value["image_url"]);
+                }
+                Err("only text parts and user image_url parts are supported")
             })
             .collect(),
-        _ => Err("message content must be a string or a non-empty array of text parts"),
+        _ => Err("message content must be a string or a non-empty array of parts"),
     }
+}
+
+fn image_part(image: &Value) -> Result<Value, &'static str> {
+    let url = nonempty(&image["url"]).ok_or("image_url.url must be a non-empty string")?;
+    let detail = match &image["detail"] {
+        Value::Null => "auto",
+        value => match value.as_str() {
+            Some(detail @ ("auto" | "low" | "high")) => detail,
+            _ => return Err("image_url.detail must be auto, low, or high"),
+        },
+    };
+    Ok(json!({"type": "input_image", "image_url": url, "detail": detail}))
 }
 
 fn tool_definition(mut tool: Value) -> Result<Value, &'static str> {
     if tool["type"] != "function" {
         return Err("only function tools are supported on Chat Completions");
     }
-    let Value::Object(mut function) = tool["function"].take() else {
+    function_definition(tool["function"].take())
+}
+
+fn function_definition(function: Value) -> Result<Value, &'static str> {
+    let Value::Object(mut function) = function else {
         return Err("a function tool requires a function definition");
     };
     function.retain(|_, value| !value.is_null());
@@ -599,6 +680,53 @@ mod tests {
                 "expected {field} to be rejected"
             );
         }
+    }
+
+    #[test]
+    fn converts_user_images_in_order() {
+        let mut body = json!({"model": "codex", "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "Compare these"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/image.png", "detail": "high"}},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,YQ=="}}
+        ]}]});
+        let (request, _) = into_responses(body.clone()).expect("user images should convert");
+        assert_eq!(
+            request["input"][0]["content"],
+            json!([
+                {"type": "input_text", "text": "Compare these"},
+                {"type": "input_image", "image_url": "https://example.com/image.png", "detail": "high"},
+                {"type": "input_image", "image_url": "data:image/png;base64,YQ==", "detail": "auto"}
+            ])
+        );
+        body["messages"][0]["content"][1]["image_url"]["detail"] = json!("invalid");
+        assert!(into_responses(body).is_err());
+    }
+
+    #[test]
+    fn validates_legacy_function_options_and_result_pairing() {
+        let mut body = json!({"model": "codex", "messages": [{"role": "user", "content": "hi"}],
+            "functions": [{"name": "lookup"}]});
+        for choice in ["auto", "none"] {
+            body["function_call"] = json!(choice);
+            let (request, _) =
+                into_responses(body.clone()).expect("legacy function choice should convert");
+            assert_eq!(request["tool_choice"], choice);
+            assert_eq!(request["parallel_tool_calls"], false);
+        }
+        body["tools"] = json!([]);
+        assert!(
+            into_responses(body.clone()).is_err(),
+            "conflicting tool declarations"
+        );
+        body["tools"] = Value::Null;
+        body["messages"] = json!([
+            {"role": "assistant", "function_call": {"name": "lookup", "arguments": "{}"}},
+            {"role": "function", "name": "different_function", "content": "result"}
+        ]);
+        assert!(
+            into_responses(body).is_err(),
+            "unmatched legacy function result"
+        );
     }
 
     #[test]

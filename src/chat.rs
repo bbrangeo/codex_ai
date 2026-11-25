@@ -1,4 +1,4 @@
-//! Chat Completions text and function tools over Responses.
+//! Chat Completions text, images, and function tools over Responses.
 
 mod completion;
 mod request;

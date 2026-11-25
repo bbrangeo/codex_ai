@@ -34,12 +34,11 @@ impl Metadata {
     }
 }
 
-fn finish_reason(response: &Value, has_tools: bool) -> &'static str {
+fn finish_reason(response: &Value, call_reason: Option<&'static str>) -> &'static str {
     match response["incomplete_details"]["reason"].as_str() {
         Some("max_tokens" | "max_output_tokens") => "length",
         Some("content_filter") => "content_filter",
-        _ if has_tools => "tool_calls",
-        _ => "stop",
+        _ => call_reason.unwrap_or("stop"),
     }
 }
 
@@ -90,12 +89,49 @@ fn usage(response: &Value) -> Option<Value> {
     Some(result)
 }
 
-/// Converts the terminal Responses payload into a single Chat choice.
+/// Converts the terminal Responses payload into a single Chat choice using current tool fields.
 pub fn completion(response: &Value, model: &str) -> Value {
+    complete(response, model, "tool_calls")
+}
+
+impl ChatOptions {
+    /// Converts the terminal payload using the Chat client’s function format.
+    pub fn completion(&self, response: &Value) -> Value {
+        complete(response, &self.model, self.call_field())
+    }
+
+    fn call_field(&self) -> &'static str {
+        if self.legacy_functions {
+            "function_call"
+        } else {
+            "tool_calls"
+        }
+    }
+}
+
+const SUMMARY_SEPARATOR: &str = "\n\n";
+
+fn summary_parts(item: &Value) -> impl Iterator<Item = (u64, &str)> {
+    item["summary"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .zip(0..)
+        .filter_map(|(part, index)| {
+            let text = part["text"].as_str()?;
+            (part["type"] == "summary_text" && !text.is_empty()).then_some((index, text))
+        })
+}
+
+fn complete(response: &Value, model: &str, call_field: &'static str) -> Value {
     let mut content = None;
     let mut refusal = None;
+    let mut summaries = Vec::new();
     let mut tool_calls = Vec::new();
     for item in response["output"].as_array().into_iter().flatten() {
+        if item["type"] == "reasoning" {
+            summaries.extend(summary_parts(item).map(|(_, text)| text));
+        }
         if let Some(call) = FunctionCall::from_item(item) {
             tool_calls.push(call.chat_value());
         }
@@ -111,16 +147,23 @@ pub fn completion(response: &Value, model: &str) -> Value {
         }
     }
     let mut message = json!({"role": "assistant", "content": content, "refusal": refusal});
-    let has_tools = !tool_calls.is_empty();
-    if has_tools {
-        message["tool_calls"] = Value::Array(tool_calls);
+    if !summaries.is_empty() {
+        message["reasoning_content"] = json!(summaries.join(SUMMARY_SEPARATOR));
+    }
+    let call_reason = (!tool_calls.is_empty()).then_some(call_field);
+    if let Some(field) = call_reason {
+        message[field] = if field == "function_call" {
+            tool_calls[0]["function"].take()
+        } else {
+            Value::Array(tool_calls)
+        };
     }
     let mut result = Metadata::new(response, model).envelope(
         "chat.completion",
         json!([{
             "index": 0,
             "message": message,
-            "finish_reason": finish_reason(response, has_tools),
+            "finish_reason": finish_reason(response, call_reason),
         }]),
     );
     if let Some(usage) = usage(response) {
@@ -158,13 +201,87 @@ impl StreamToolCall {
     }
 }
 
-/// Tracks one choice's headers and tool calls across Responses events.
+#[derive(Debug, Default)]
+struct StreamReasoning {
+    current_item_id: Option<String>,
+    parts: Vec<StreamSummaryPart>,
+}
+
+#[derive(Debug)]
+struct StreamSummaryPart {
+    item_id: Option<String>,
+    output_index: Option<u64>,
+    index: u64,
+    text: String,
+}
+
+impl StreamReasoning {
+    fn update(
+        &mut self,
+        item_id: Option<&str>,
+        output_index: Option<u64>,
+        index: u64,
+        text: &str,
+        snapshot: bool,
+    ) -> Option<Value> {
+        if text.is_empty() {
+            return None;
+        }
+        let item_id = item_id.or_else(|| {
+            self.current_item_id
+                .as_deref()
+                .filter(|_| output_index.is_none())
+        });
+        let part = self.parts.iter_mut().rfind(|part| {
+            part.index == index
+                && match (
+                    item_id.zip(part.item_id.as_deref()),
+                    output_index.zip(part.output_index),
+                ) {
+                    (Some((id, other)), _) => id == other,
+                    (_, Some((index, other))) => index == other,
+                    _ => part.item_id.is_none() && part.output_index.is_none(),
+                }
+        });
+        if let Some(part) = part {
+            if part.item_id.is_none() {
+                part.item_id = item_id.map(str::to_owned);
+            }
+            part.output_index = part.output_index.or(output_index);
+            let delta = if snapshot {
+                text.strip_prefix(&part.text)?
+            } else {
+                text
+            };
+            if delta.is_empty() {
+                return None;
+            }
+            part.text.push_str(delta);
+            return Some(json!({"reasoning_content": delta}));
+        }
+        let separator = if self.parts.is_empty() {
+            ""
+        } else {
+            SUMMARY_SEPARATOR
+        };
+        self.parts.push(StreamSummaryPart {
+            item_id: item_id.map(str::to_owned),
+            output_index,
+            index,
+            text: text.to_owned(),
+        });
+        Some(json!({"reasoning_content": format!("{separator}{text}")}))
+    }
+}
+
+/// Tracks one choice's headers, reasoning summaries, and tool calls across Responses events.
 #[derive(Debug)]
 pub struct ChatStream {
     options: ChatOptions,
     metadata: Option<Metadata>,
     // ponytail: linear lookup across the tool calls in one choice; keep index order naturally.
     tool_calls: Vec<StreamToolCall>,
+    reasoning: StreamReasoning,
     finished: bool,
 }
 
@@ -175,6 +292,7 @@ impl ChatStream {
             options,
             metadata: None,
             tool_calls: Vec::new(),
+            reasoning: StreamReasoning::default(),
             finished: false,
         }
     }
@@ -218,6 +336,17 @@ impl ChatStream {
         }
     }
 
+    fn observe_output(&mut self, item: &Value, output_index: Option<u64>, deltas: &mut Vec<Value>) {
+        if item["type"] == "reasoning" {
+            deltas.extend(summary_parts(item).filter_map(|(index, text)| {
+                self.reasoning
+                    .update(nonempty(&item["id"]), output_index, index, text, true)
+            }));
+        } else {
+            deltas.extend(self.observe_tool(item, output_index));
+        }
+    }
+
     /// Converts one Responses event; SSE framing and errors belong to the caller.
     pub fn chunks(&mut self, event: &Value) -> Vec<Value> {
         if self.finished {
@@ -239,12 +368,36 @@ impl ChatStream {
                 };
                 deltas.push(delta);
             }
-            Some("response.output_item.added" | "response.output_item.done") => {
-                let Some(delta) = self.observe_tool(&event["item"], event["output_index"].as_u64())
-                else {
-                    return Vec::new();
+            Some("response.output_item.added") => {
+                let item = &event["item"];
+                if item["type"] == "reasoning" {
+                    self.reasoning.current_item_id = nonempty(&item["id"]).map(str::to_owned);
+                }
+                deltas.extend(self.observe_tool(item, event["output_index"].as_u64()));
+            }
+            Some("response.output_item.done") => {
+                self.observe_output(&event["item"], event["output_index"].as_u64(), &mut deltas);
+            }
+            Some(
+                "response.reasoning_summary_text.delta"
+                | "response.reasoning_summary_text.done"
+                | "response.reasoning_summary_part.done",
+            ) => {
+                let text = match kind {
+                    Some("response.reasoning_summary_text.delta") => &event["delta"],
+                    Some("response.reasoning_summary_text.done") => &event["text"],
+                    _ if event["part"]["type"] == "summary_text" => &event["part"]["text"],
+                    _ => return Vec::new(),
                 };
-                deltas.push(delta);
+                if let Some(text) = text.as_str() {
+                    deltas.extend(self.reasoning.update(
+                        nonempty(&event["item_id"]),
+                        event["output_index"].as_u64(),
+                        event["summary_index"].as_u64().unwrap_or_default(),
+                        text,
+                        kind != Some("response.reasoning_summary_text.delta"),
+                    ));
+                }
             }
             Some(
                 "response.function_call_arguments.delta" | "response.function_call_arguments.done",
@@ -256,15 +409,17 @@ impl ChatStream {
             }
             Some("response.completed" | "response.incomplete") => {
                 self.finished = true;
-                deltas.extend(
-                    response["output"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|item| self.observe_tool(item, None)),
-                );
+                for (item, index) in response["output"].as_array().into_iter().flatten().zip(0..) {
+                    self.observe_output(item, Some(index), &mut deltas);
+                }
             }
             _ => return Vec::new(),
+        }
+        if deltas.is_empty()
+            && !self.finished
+            && !matches!(kind, Some("response.created" | "response.in_progress"))
+        {
+            return Vec::new();
         }
         let mut chunks = Vec::new();
         let first = self.metadata.is_none();
@@ -286,13 +441,23 @@ impl ChatStream {
         if first {
             push_choice(json!({"role": "assistant", "content": ""}), None);
         }
-        for delta in deltas {
+        for mut delta in deltas {
+            if self.options.legacy_functions
+                && let Some(call) = delta
+                    .get_mut("tool_calls")
+                    .and_then(|calls| calls.get_mut(0))
+            {
+                delta = json!({"function_call": call["function"].take()});
+            }
             push_choice(delta, None);
         }
         if self.finished {
             push_choice(
                 json!({}),
-                Some(finish_reason(response, !self.tool_calls.is_empty())),
+                Some(finish_reason(
+                    response,
+                    (!self.tool_calls.is_empty()).then(|| self.options.call_field()),
+                )),
             );
         }
         if self.finished
@@ -315,7 +480,10 @@ mod tests {
         let result = completion(
             &json!({
                 "id": "resp_test", "created_at": 42, "output": [
-                    {"type": "reasoning", "content": [{"type": "output_text", "text": "hidden"}]},
+                    {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "hidden"}],
+                        "encrypted_content": "opaque", "summary": [
+                            {"type": "summary_text", "text": "First"}, {"type": "summary_text", "text": "Second"}
+                        ]},
                     {"type": "message", "content": [
                         {"type": "output_text", "text": "hello"}, {"type": "output_text", "text": "!"},
                         {"type": "refusal", "refusal": "no"}
@@ -332,7 +500,8 @@ mod tests {
             json!({
                 "id": "chatcmpl-test", "created": 42, "model": "codex", "object": "chat.completion",
                 "choices": [{"index": 0, "finish_reason": "content_filter",
-                    "message": {"role": "assistant", "content": "hello!", "refusal": "no"}}],
+                    "message": {"role": "assistant", "content": "hello!", "refusal": "no",
+                        "reasoning_content": "First\n\nSecond"}}],
                 "usage": {"prompt_tokens": 8, "completion_tokens": 4, "total_tokens": 12,
                     "prompt_tokens_details": {"cached_tokens": 3}, "completion_tokens_details": {"reasoning_tokens": 2}}
             })
@@ -345,6 +514,7 @@ mod tests {
             model: "codex".into(),
             stream: true,
             include_usage: true,
+            legacy_functions: false,
         });
         let created = stream.chunks(&json!({"type": "response.created", "response": {
             "id": "resp_test", "model": "codex-version", "created_at": 42
@@ -380,11 +550,68 @@ mod tests {
     }
 
     #[test]
+    fn streams_reasoning_summaries_without_repeating_snapshots() {
+        let (_, options) = crate::chat::into_responses(json!({
+            "model": "codex", "stream": true, "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .expect("request should convert");
+        let mut stream = ChatStream::new(options);
+        let item = json!({"type": "reasoning", "id": "rs_1", "summary": [
+            {"type": "summary_text", "text": "Checking the answer"},
+            {"type": "summary_text", "text": "Confirmed"}
+        ]});
+        let data = |chunks: Vec<Value>| {
+            chunks
+                .into_iter()
+                .filter_map(|chunk| {
+                    chunk["choices"][0]["delta"]["reasoning_content"]
+                        .as_str()
+                        .map(str::to_owned)
+                })
+                .collect::<String>()
+        };
+        assert_eq!(
+            data(stream.chunks(&json!({
+                "type": "response.reasoning_summary_text.delta", "summary_index": 0,
+                "item_id": "rs_1", "delta": "Checking"
+            }))),
+            "Checking"
+        );
+        assert!(
+            stream
+                .chunks(&json!({"type": "response.reasoning_text.delta", "delta": "hidden"}))
+                .is_empty()
+        );
+        assert_eq!(
+            data(
+                stream.chunks(&json!({"type": "response.reasoning_summary_text.done",
+                    "item_id": "rs_1", "summary_index": 0, "text": "Checking the answer"
+                }))
+            ),
+            " the answer"
+        );
+        assert_eq!(
+            data(stream.chunks(&json!({
+                "type": "response.output_item.done", "output_index": 0, "item": item
+            }))),
+            "\n\nConfirmed"
+        );
+        assert!(
+            data(
+                stream
+                    .chunks(&json!({"type": "response.completed", "response": {"output": [item]}}))
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
     fn streams_two_interleaved_calls_without_repeating_arguments() {
         let mut stream = ChatStream::new(ChatOptions {
             model: "codex".into(),
             stream: true,
             include_usage: false,
+            legacy_functions: false,
         });
         let first = json!({"type": "function_call", "id":"fc_1", "call_id":"call_1", "name":"get_local_time", "arguments":""});
         let second = json!({"type": "function_call", "id":"fc_2", "call_id":"call_2", "name":"get_local_time", "arguments":""});
@@ -425,6 +652,7 @@ mod tests {
             model: "codex".into(),
             stream: true,
             include_usage: false,
+            legacy_functions: false,
         });
         let chunks = stream.chunks(&json!({"type": "response.completed", "response": {
             "id": "resp_test", "usage": {"input_tokens": 2, "output_tokens": 0}
