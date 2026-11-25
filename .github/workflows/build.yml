@@ -149,7 +149,7 @@ jobs:
       - name: Authenticate to crates.io
         if: steps.crates-io.outputs.publish == 'true'
         id: auth
-        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca80c54cd9 # v1.0.6
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
       - name: Publish to crates.io
         if: steps.crates-io.outputs.publish == 'true'
         run: cargo publish --locked --registry crates-io
