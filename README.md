@@ -113,6 +113,11 @@ curl -fsS http://127.0.0.1:8787/v1/models \
   -H "Authorization: Bearer $CODEX_API_KEY"
 ```
 
+Each model keeps the standard OpenAI fields and adds an `x_codex` object with
+catalog metadata when available: `context_window` (tokens),
+`supported_reasoning_levels` (objects with `effort`), `default_reasoning_level`,
+`input_modalities`, and `service_tiers` (objects with `id`).
+
 ### Generate a response
 
 Replace `MODEL_ID` with an `id` returned by `/v1/models`.
@@ -170,11 +175,18 @@ coding agent that edits files or executes your client's tools.
 
 Leading `system` messages are sent to Codex as one leading `developer` message so their text can be part of the cached prefix. An explicit Responses `instructions` field is forwarded separately. Tool call IDs over Codex's 64-character limit are shortened consistently for calls and their matching results before forwarding.
 
-Chat Completions accepts `reasoning` as a Responses-style object (`{"effort":"high"}`)
-or as an effort string (`"high"`). An explicit effort in `reasoning` takes
-precedence over `reasoning_effort`. Boolean `true` supplies `medium` only if no
-explicit effort is given; `false` supplies no effort override and does not
-disable reasoning on models that require it.
+Both generation endpoints return `400` for a `reasoning.effort` or `service_tier`
+that the model catalog does not support. Use `priority` for Fast and `ultrafast`
+for Ultrafast. If no effort is specified, the gateway uses the model's catalog
+default when available. The catalog is shared with `/v1/models` and cached for
+five minutes; if it is unavailable, a model is not listed in it, or the relevant
+metadata is missing, the gateway leaves that model-specific validation to Codex.
+
+Chat Completions also accepts `reasoning` as an effort string (`"high"`). An
+explicit effort in `reasoning` takes precedence over `reasoning_effort`.
+Boolean `true` requests the catalog default, or `medium` if there is no default
+and `medium` is not known to be unsupported. Boolean `false` supplies no effort
+override; it does not disable reasoning.
 
 ### Testing a Chat Completions tool call
 

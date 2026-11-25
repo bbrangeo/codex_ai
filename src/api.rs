@@ -1,3 +1,4 @@
+mod catalog;
 mod stream;
 #[cfg(test)]
 mod tests;
@@ -16,23 +17,24 @@ use codex_ai::InvalidRequest;
 use codex_ai::chat::{self, ChatStream};
 use codex_ai::responses::normalize_request;
 use reqwest::{Client, RequestBuilder};
-use serde::Deserialize;
 use serde_json::{Value, json};
 use subtle::ConstantTimeEq as _;
+use tokio::sync::Mutex;
 
+use self::catalog::CachedCatalog;
 use self::stream::{Output, collect_response, stream_response, terminal_failure};
 use crate::auth::{Credentials, ORIGINATOR, Session, SessionError};
 use crate::telemetry::{LogLevel, Trace};
 
 const CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
-// As in Zed, the catalog uses a Codex compatibility version, not the host version.
-const MODEL_CATALOG_CLIENT_VERSION: &str = "0.999.0";
+
 const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 
 pub(super) struct Codex {
     client: Client,
     session: Arc<Session>,
     base_url: String,
+    catalog: Mutex<Option<CachedCatalog>>,
 }
 
 impl Codex {
@@ -41,6 +43,7 @@ impl Codex {
             client,
             session: Arc::new(session),
             base_url: CODEX_BASE_URL.into(),
+            catalog: Mutex::new(None),
         }
     }
 
@@ -87,10 +90,13 @@ impl Codex {
 
     async fn start_response(
         &self,
-        body: &Value,
+        body: &mut Value,
         stream: bool,
+        fallback_effort: Option<&str>,
         trace: Trace,
     ) -> Result<reqwest::Response, ApiError> {
+        self.apply_model_options(body, fallback_effort, trace)
+            .await?;
         trace.event(format_args!(
             "codex.request model={} stream={stream} tools={}",
             model_for_debug(&body["model"]),
@@ -243,39 +249,11 @@ async fn authorize(State(key): State<HeaderValue>, request: Request, next: Next)
         .into_response()
 }
 
-#[derive(Deserialize)]
-struct Catalog {
-    models: Vec<CatalogModel>,
-}
-
-#[derive(Deserialize)]
-struct CatalogModel {
-    slug: String,
-    visibility: String,
-    priority: i32,
-}
-
 async fn models(
     State(codex): State<Arc<Codex>>,
     Extension(trace): Extension<Trace>,
 ) -> Result<Json<Value>, ApiError> {
-    let url = format!("{}/models", codex.base_url);
-    let response = codex
-        .send(trace, || {
-            codex
-                .client
-                .get(&url)
-                .query(&[("client_version", MODEL_CATALOG_CLIENT_VERSION)])
-                .header(header::ACCEPT, "application/json")
-        })
-        .await?;
-    let mut catalog: Catalog = response.json().await?;
-    catalog.models.retain(|model| model.visibility == "list");
-    catalog.models.sort_by_key(|model| model.priority);
-    let data: Vec<_> = catalog.models.into_iter().map(|model| {
-        json!({"id": model.slug, "object": "model", "created": 0, "owned_by": "openai"})
-    }).collect();
-    Ok(Json(json!({"object": "list", "data": data})))
+    Ok(Json(codex.catalog(trace).await?.listing()))
 }
 
 async fn responses(
@@ -285,7 +263,7 @@ async fn responses(
 ) -> Result<Response, ApiError> {
     let mut body = body?.0;
     let stream = normalize_request(&mut body)?;
-    let upstream = codex.start_response(&body, stream, trace).await?;
+    let upstream = codex.start_response(&mut body, stream, None, trace).await?;
     if stream {
         Ok(stream_response(upstream, Output::Responses, trace))
     } else {
@@ -303,6 +281,11 @@ async fn chat_completions(
     if matches!(chat_tools, ChatTools::FunctionsOnly) {
         filter_chat_tools(&mut body, trace);
     }
+    // Let the catalog choose before falling back to the Chat shorthand's medium effort.
+    let fallback_effort = (body["reasoning"] == true).then_some("medium");
+    if fallback_effort.is_some() {
+        body["reasoning"] = Value::Null;
+    }
     let (mut body, options) = chat::into_responses(body).inspect_err(|error| {
         trace.event(format_args!(
             "chat.validation_rejected reason={:?}",
@@ -310,7 +293,9 @@ async fn chat_completions(
         ));
     })?;
     normalize_request(&mut body)?;
-    let upstream = codex.start_response(&body, options.stream(), trace).await?;
+    let upstream = codex
+        .start_response(&mut body, options.stream(), fallback_effort, trace)
+        .await?;
     if options.stream() {
         Ok(stream_response(
             upstream,
@@ -361,6 +346,7 @@ fn filter_chat_tools(body: &mut Value, trace: Trace) {
     ));
 }
 
+#[derive(Clone)]
 struct ApiError {
     status: StatusCode,
     code: &'static str,
@@ -395,6 +381,10 @@ impl ApiError {
             provider_code: None,
             message: message.into(),
         }
+    }
+
+    fn invalid_request(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "invalid_request", message)
     }
 
     fn gateway(message: impl Into<String>) -> Self {
@@ -469,11 +459,7 @@ impl ApiError {
 
 impl From<InvalidRequest> for ApiError {
     fn from(error: InvalidRequest) -> Self {
-        Self::new(
-            StatusCode::BAD_REQUEST,
-            "invalid_request",
-            error.to_string(),
-        )
+        Self::invalid_request(error.to_string())
     }
 }
 

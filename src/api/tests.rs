@@ -1,4 +1,5 @@
 use std::convert::Infallible;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::http::HeaderMap;
 use futures_util::StreamExt as _;
@@ -171,16 +172,49 @@ async fn distinguishes_sse_terminator_without_final_response_from_timeout() -> R
 #[tokio::test]
 async fn serves_openai_formats_with_local_auth_and_codex_upstream() -> Result<()> {
     const KEY: &str = "only-for-the-local-mocked-api-test";
+    let catalog_reads = Arc::new(AtomicUsize::new(0));
+    let generations = Arc::new(AtomicUsize::new(0));
+    let capabilities = json!({
+        "context_window": 128_000,
+        "supported_reasoning_levels": [
+            {"effort": "low", "description": "Low"}, {"effort": "high"}
+        ],
+        "default_reasoning_level": "low",
+        "input_modalities": ["text", "image"],
+        "service_tiers": [{"id": "fast", "name": "Fast", "description": "Faster"}]
+    });
+    let mut model = capabilities.clone();
+    model["slug"] = json!("mock-model");
+    model["visibility"] = json!("list");
+    model["priority"] = json!(1);
+    model["base_instructions"] = json!("private provider instructions");
+    let reads = Arc::clone(&catalog_reads);
+    let calls = Arc::clone(&generations);
     let mock = Router::new()
-        .route("/models", get(|headers: HeaderMap| async move {
+        .route("/models", get(move |headers: HeaderMap| async move {
+            reads.fetch_add(1, Ordering::Relaxed);
             assert_eq!(headers[header::AUTHORIZATION], "Bearer test-upstream-token");
             Json(json!({"models": [
+                {"slug": "mock-json", "visibility": "list", "priority": 2},
                 {"slug": "hidden", "visibility": "hide", "priority": 0},
-                {"slug": "mock-model", "visibility": "list", "priority": 1}
+                model
             ]}))
         }))
-        .route("/responses", post(|headers: HeaderMap, Json(body): Json<Value>| async move {
+        .route("/responses", post(move |headers: HeaderMap, Json(body): Json<Value>| async move {
+            calls.fetch_add(1, Ordering::Relaxed);
             assert_eq!(headers[header::AUTHORIZATION], "Bearer test-upstream-token");
+            if body["model"] == "mock-model" {
+                if body["service_tier"] == "priority" {
+                    assert_eq!(body["reasoning"]["effort"], "high");
+                } else {
+                    assert_eq!(body["reasoning"]["effort"], "low");
+                }
+                if body["prompt_cache_key"] == "expect-summary" {
+                    assert_eq!(body["reasoning"]["summary"], "auto");
+                }
+            } else {
+                assert!(body.get("reasoning").is_none());
+            }
             assert_eq!(headers["chatgpt-account-id"], "test-account");
             assert_eq!(body["store"], false);
             assert_eq!(body["stream"], true);
@@ -228,16 +262,7 @@ async fn serves_openai_formats_with_local_auth_and_codex_upstream() -> Result<()
     let models_url = format!("{local}/v1/models");
     let rejected = client.get(&models_url).send().await?;
     assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
-    let models: Value = client
-        .get(&models_url)
-        .bearer_auth(KEY)
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    assert_eq!(models["data"][0]["id"], "mock-model");
-    assert_eq!(models["data"].as_array().map(Vec::len), Some(1));
+    assert_eq!(catalog_reads.load(Ordering::Relaxed), 0);
     let url = format!("{local}/v1/responses");
     let request = |stream| {
         client.post(&url).bearer_auth(KEY).json(&json!({
@@ -252,6 +277,21 @@ async fn serves_openai_formats_with_local_auth_and_codex_upstream() -> Result<()
         .json()
         .await?;
     assert_eq!(response["output"][0]["content"][0]["text"], "Hi");
+    let models: Value = client
+        .get(&models_url)
+        .bearer_auth(KEY)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(
+        models,
+        json!({"object": "list", "data": [
+            {"id": "mock-model", "object": "model", "created": 0, "owned_by": "openai", "x_codex": capabilities},
+            {"id": "mock-json", "object": "model", "created": 0, "owned_by": "openai", "x_codex": {}}
+        ]})
+    );
     let events = request(true)
         .send()
         .await?
@@ -271,7 +311,66 @@ async fn serves_openai_formats_with_local_auth_and_codex_upstream() -> Result<()
         "Hi"
     );
 
-    let url = format!("{local}/v1/chat/completions");
+    let chat_url = format!("{local}/v1/chat/completions");
+    let before = generations.load(Ordering::Relaxed);
+    for (endpoint, payload, field, allowed) in [
+        (
+            &url,
+            json!({"input": "Hello", "reasoning": {"effort": "xhigh"}}),
+            "reasoning.effort",
+            "high",
+        ),
+        (
+            &chat_url,
+            json!({"messages": [{"role": "user", "content": "Hello"}], "service_tier": "ultrafast", "stream": true}),
+            "service_tier",
+            "priority",
+        ),
+        (
+            &chat_url,
+            json!({"messages": [{"role": "user", "content": "Hello"}], "reasoning_effort": "medium"}),
+            "reasoning.effort",
+            "low",
+        ),
+    ] {
+        let mut payload = payload;
+        payload["model"] = json!("mock-model");
+        let response = client
+            .post(endpoint)
+            .bearer_auth(KEY)
+            .json(&payload)
+            .send()
+            .await?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error: Value = response.json().await?;
+        let message = error["error"]["message"]
+            .as_str()
+            .context("expected a validation message")?;
+        for part in [field, "mock-model", allowed] {
+            assert!(message.contains(part), "missing {part} in {message}");
+        }
+    }
+    assert_eq!(generations.load(Ordering::Relaxed), before);
+
+    for payload in [
+        json!({"reasoning_effort": "high", "service_tier": "priority"}),
+        json!({"reasoning": true}),
+        json!({"reasoning": {"summary": "auto"}, "prompt_cache_key": "expect-summary"}),
+        json!({"service_tier": "flex"}),
+    ] {
+        let mut payload = payload;
+        payload["model"] = json!("mock-model");
+        payload["messages"] = json!([{"role": "user", "content": "Hello"}]);
+        client
+            .post(&chat_url)
+            .bearer_auth(KEY)
+            .json(&payload)
+            .send()
+            .await?
+            .error_for_status()?;
+    }
+
+    let url = chat_url;
     let rejected = client
         .post(&url)
         .bearer_auth(KEY)
@@ -323,6 +422,7 @@ async fn serves_openai_formats_with_local_auth_and_codex_upstream() -> Result<()
         .context("expected an error message")?;
     assert!(message.contains("text/html"));
     assert!(!message.contains("do not forward"));
+    assert_eq!(catalog_reads.load(Ordering::Relaxed), 1);
     local_task.abort();
     upstream_task.abort();
     Ok(())
@@ -390,6 +490,7 @@ async fn translates_chat_tool_calls_over_http() -> Result<()> {
                     json!({"effort": "high", "summary": "auto"})
                 );
                 assert_eq!(body["input"][0]["role"], "user");
+                assert_eq!(body["service_tier"], "ultrafast");
                 let mut events = vec![json!({"type": "response.created", "response": {
                     "id": "resp_tools", "model": body["model"], "created_at": 1
                 }})];
@@ -450,6 +551,13 @@ async fn translates_chat_tool_calls_over_http() -> Result<()> {
         ChatTools::FunctionsOnly,
     ))
     .await?;
+    let catalog_status = client
+        .get(format!("{local}/v1/models"))
+        .bearer_auth(KEY)
+        .send()
+        .await?
+        .status();
+    assert_eq!(catalog_status, StatusCode::NOT_FOUND);
     let url = format!("{local}/v1/chat/completions");
     let user = json!({"role": "user", "content": "What time is it in Paris?"});
 
@@ -457,7 +565,7 @@ async fn translates_chat_tool_calls_over_http() -> Result<()> {
         client.post(&url).bearer_auth(KEY).json(&json!({
             "model": "mock-model", "messages": messages, "tools": chat_tools,
             "stream": stream, "reasoning": {"effort": "high", "summary": "auto"},
-            "user": "test-user"
+            "service_tier": "ultrafast", "user": "test-user"
         }))
     };
 
