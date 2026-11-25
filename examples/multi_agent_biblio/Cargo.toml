@@ -17,9 +17,13 @@ rand = "0.9"
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
 rig = { package = "rig-core", version = "0.47.1", default-features = false, features = ["reqwest", "rustls"] }
 rig-agent = { version = "0.47.1", default-features = false }
+rig-memory = { version = "0.47.1", default-features = false }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+[dev-dependencies]
+rig = { package = "rig-core", version = "0.47.1", default-features = false, features = ["test-utils"] }

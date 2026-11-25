@@ -5,12 +5,12 @@ use clap::Parser;
 use futures::{StreamExt, TryStreamExt, stream};
 use rand::seq::SliceRandom;
 
-use rig::message::Message;
 use rig::providers::{
     chatgpt,
     openai::{OpenAI, OpenAIConfig},
 };
 use rig_agent::{Agent, AgentBuilder, extractor::ExtractorBuilder};
+use rig_memory::{MemoryStore, load, save};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
@@ -172,17 +172,26 @@ struct Role {
     preamble: &'static str,
     model: String,
     temperature: f64,
-    history: Vec<Message>,
+    conversation_id: String,
+    memory: MemoryStore,
 }
 
 impl Role {
-    fn new(name: &'static str, preamble: &'static str, model: String, temperature: f64) -> Self {
+    fn new(
+        name: &'static str,
+        preamble: &'static str,
+        model: String,
+        temperature: f64,
+        conversation_id: impl Into<String>,
+        memory: &MemoryStore,
+    ) -> Self {
         Self {
             name,
             preamble,
             model,
             temperature,
-            history: Vec::new(),
+            conversation_id: conversation_id.into(),
+            memory: memory.clone(),
         }
     }
 
@@ -190,26 +199,24 @@ impl Role {
         AgentBuilder::new(client.responses(self.model.as_str()))
             .preamble(self.preamble)
             .temperature(self.temperature)
+            .memory(self.memory.clone())
+            .conversation(self.conversation_id.as_str())
     }
 
-    async fn ask(&mut self, agent: &Agent, prompt: String) -> Result<String> {
+    async fn ask(&self, agent: &Agent, prompt: String) -> Result<String> {
         let response = tokio::time::timeout(
             Duration::from_secs(240),
-            agent
-                .prompt(prompt)
-                .history(self.history.iter().cloned())
-                .tool_concurrency(1),
+            agent.prompt(prompt).tool_concurrency(1),
         )
         .await
         .with_context(|| format!("[{}] délai de réponse dépassé. {GATEWAY_HELP}", self.name))?
         .with_context(|| format!("[{}] appel Rig en échec. {GATEWAY_HELP}", self.name))?;
         let text = response.output();
         ensure!(!text.trim().is_empty(), "[{}] réponse vide", self.name);
-        self.history.extend_from_slice(response.messages());
         Ok(text)
     }
 
-    async fn extract<T>(&mut self, client: &OpenAI, prompt: String) -> Result<T>
+    async fn extract<T>(&self, client: &OpenAI, prompt: String) -> Result<T>
     where
         T: JsonSchema + DeserializeOwned + Send + Sync + 'static,
     {
@@ -217,16 +224,21 @@ impl Role {
             .append_preamble(self.preamble)
             .retries(1)
             .build();
+        // Rig enregistre le tour avant la désérialisation ; ne garder que l’essai validé.
+        let mut conversation = load(&self.memory, &self.conversation_id)
+            .with_context(|| format!("[{}] lecture de la conversation", self.name))?;
         let response = tokio::time::timeout(
             Duration::from_secs(180),
             extractor
                 .extract(prompt)
-                .history(self.history.iter().cloned()),
+                .history(conversation.messages().iter().map(Arc::as_ref).cloned()),
         )
         .await
         .with_context(|| format!("[{}] délai d’extraction dépassé. {GATEWAY_HELP}", self.name))?
         .with_context(|| format!("[{}] extraction Rig en échec. {GATEWAY_HELP}", self.name))?;
-        self.history.extend(response.messages);
+        conversation.extend(response.messages);
+        save(&self.memory, &self.conversation_id, &mut conversation)
+            .with_context(|| format!("[{}] enregistrement de la conversation", self.name))?;
         Ok(response.output)
     }
 }
@@ -268,7 +280,7 @@ fn keywords(terms: &[String], fallback: &str) -> String {
 }
 
 async fn research_topic(
-    role: &mut Role,
+    role: &Role,
     client: &OpenAI,
     state: Arc<ToolState>,
     plan: &ResearchPlan,
@@ -321,34 +333,27 @@ async fn research(
     client: &OpenAI,
     sources: &Arc<Sources>,
     plan: &ResearchPlan,
-    researchers: &mut [Role],
+    researchers: &[Role],
     followups: Option<&[NewQuery]>,
 ) -> Result<Vec<Selected>> {
-    let tasks = stream::iter(
-        researchers
-            .iter_mut()
-            .enumerate()
-            .filter_map(|(index, role)| {
-                let queries: Vec<_> = followups
-                    .into_iter()
-                    .flatten()
-                    .filter(|q| q.question == index + 1 && !q.query.trim().is_empty())
-                    .collect();
-                if followups.is_some() && queries.is_empty() {
-                    return None;
-                }
-                let state = Arc::new(ToolState::new(
-                    Arc::clone(sources),
-                    role.name,
-                    RESEARCH_BUDGET,
-                    plan.year_from,
-                    plan.year_to,
-                ));
-                Some(
-                    async move { research_topic(role, client, state, plan, index, &queries).await },
-                )
-            }),
-    );
+    let tasks = stream::iter(researchers.iter().enumerate().filter_map(|(index, role)| {
+        let queries: Vec<_> = followups
+            .into_iter()
+            .flatten()
+            .filter(|q| q.question == index + 1 && !q.query.trim().is_empty())
+            .collect();
+        if followups.is_some() && queries.is_empty() {
+            return None;
+        }
+        let state = Arc::new(ToolState::new(
+            Arc::clone(sources),
+            role.name,
+            RESEARCH_BUDGET,
+            plan.year_from,
+            plan.year_to,
+        ));
+        Some(async move { research_topic(role, client, state, plan, index, &queries).await })
+    }));
     let grouped: Vec<Vec<Selected>> = tasks.buffered(RESEARCH_CONCURRENCY).try_collect().await?;
     Ok(grouped.into_iter().flatten().collect())
 }
@@ -373,7 +378,7 @@ fn verified_by(reference: &Reference, resolved: &Reference) -> bool {
 }
 
 async fn review(
-    role: &mut Role,
+    role: &Role,
     client: &OpenAI,
     sources: &Arc<Sources>,
     plan: &ResearchPlan,
@@ -519,9 +524,31 @@ async fn main() -> Result<()> {
         cli.cache_dir.clone(),
         cli.dump_json.as_ref().map(|dir| dir.join("tools")),
     )?);
-    let mut manager = Role::new("Manager", MANAGER, model_for("MANAGER", &cli.model), 0.2);
-    let mut writer = Role::new("Rédacteur", WRITER, model_for("WRITER", &cli.model), 0.35);
-    let mut critic = Role::new("Critique", CRITIC, model_for("CRITIC", &cli.model), 0.05);
+    let memory = MemoryStore::default();
+    let manager = Role::new(
+        "Manager",
+        MANAGER,
+        model_for("MANAGER", &cli.model),
+        0.2,
+        "manager",
+        &memory,
+    );
+    let writer = Role::new(
+        "Rédacteur",
+        WRITER,
+        model_for("WRITER", &cli.model),
+        0.35,
+        "writer",
+        &memory,
+    );
+    let critic = Role::new(
+        "Critique",
+        CRITIC,
+        model_for("CRITIC", &cli.model),
+        0.05,
+        "critic",
+        &memory,
+    );
     eprintln!("[Manager] création du plan");
     let mut plan: ResearchPlan = manager
         .extract(
@@ -540,21 +567,21 @@ async fn main() -> Result<()> {
     );
     apply_years(&mut plan, &cli)?;
     dump(&cli, "plan", &plan)?;
-    let mut researchers: Vec<_> = plan
-        .questions
-        .iter()
-        .map(|_| {
+    let researchers: Vec<_> = (1..=plan.questions.len())
+        .map(|index| {
             Role::new(
                 "Chercheur",
                 RESEARCHER,
                 model_for("RESEARCHER", &cli.model),
                 0.15,
+                format!("researcher-{index}"),
+                &memory,
             )
         })
         .collect();
     let max = usize::from(cli.max_refs);
     let ranked = |candidates| shortlist(candidates, plan.year_from, plan.year_to, max);
-    let mut candidates = research(&client, &sources, &plan, &mut researchers, None).await?;
+    let mut candidates = research(&client, &sources, &plan, &researchers, None).await?;
     let mut refs = ranked(candidates.clone());
     ensure!(
         !refs.is_empty(),
@@ -580,7 +607,7 @@ async fn main() -> Result<()> {
     for round in 1..=cli.max_rounds {
         eprintln!("[Critique] tour {round}/{}", cli.max_rounds);
         let critique = review(
-            &mut critic,
+            &critic,
             &client,
             &sources,
             &plan,
@@ -613,7 +640,7 @@ async fn main() -> Result<()> {
                     &client,
                     &sources,
                     &plan,
-                    &mut researchers,
+                    &researchers,
                     Some(&decision.new_queries),
                 )
                 .await?,
@@ -664,6 +691,55 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn conversation_survives_rebuilding_without_leaking_to_another_topic() -> Result<()> {
+        use rig::{
+            message::Message,
+            test_utils::{MockCompletionModel, MockTurn},
+        };
+
+        let memory = MemoryStore::default();
+        let client = OpenAIConfig::with_key(&chatgpt::DIALECT, "test-key").client();
+        let researcher = |id| Role::new("Chercheur", RESEARCHER, "test".into(), 0.15, id, &memory);
+        let first = researcher("researcher-1");
+        let second = researcher("researcher-2");
+        let model = MockCompletionModel::from_turns([
+            MockTurn::text("Enchanté Ada."),
+            MockTurn::text("Ton nom est Ada."),
+            MockTurn::text("Je ne connais pas ton nom."),
+        ]);
+        let intro = "Mon nom est Ada.";
+        let question = "Quel est mon nom ?";
+        for (role, prompt) in [(&first, intro), (&first, question), (&second, question)] {
+            role.builder(&client)
+                .build()
+                .prompt(prompt)
+                .using_model_value(model.clone())
+                .await?;
+        }
+
+        let requests = model.requests();
+        let intro = Message::user(intro);
+        let count_intro = |index: usize| {
+            requests[index]
+                .chat_history
+                .iter()
+                .filter(|message| message.as_ref() == &intro)
+                .count()
+        };
+        assert_eq!(
+            count_intro(1),
+            1,
+            "le second tour reçoit le premier une seule fois"
+        );
+        assert_eq!(
+            count_intro(2),
+            0,
+            "l’autre sujet ne reçoit pas le premier tour"
+        );
+        Ok(())
+    }
 
     #[test]
     fn typed_extraction_rejects_unreadable_json_and_accepts_fences() {
