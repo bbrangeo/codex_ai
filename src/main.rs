@@ -1,6 +1,5 @@
 mod api;
 mod auth;
-mod chat;
 mod telemetry;
 
 use std::env;
@@ -95,7 +94,13 @@ async fn serve(log_level: LogLevel) -> Result<()> {
     );
     let client = http_client()?;
     let session = auth::Session::load(auth::Cache::open()?, client.clone())?;
-    let router = api::router(api::Codex::new(client, session), key, log_level);
+    let chat_tools =
+        if env::var_os("CODEX_CHAT_FUNCTION_TOOLS_ONLY").is_some_and(|value| value == "1") {
+            api::ChatTools::FunctionsOnly
+        } else {
+            api::ChatTools::Strict
+        };
+    let router = api::router(api::Codex::new(client, session), key, log_level, chat_tools);
     let listener = TcpListener::bind(address)
         .await
         .context("binding the local API listener")?;

@@ -166,9 +166,15 @@ coding agent that edits files or executes your client's tools.
 - **The client owns the conversation.** The gateway does not keep conversation state and sends `store: false` to Codex. Include the relevant history in `input` (Responses) or `messages` (Chat Completions) on each turn. Stored responses, `previous_response_id`, server-side conversations, and background mode are not supported.
 - **The client runs its own functions.** The gateway returns function calls and translates the results your client sends back; it does not execute those functions. For multi-turn tool workflows, prefer Responses and replay any opaque reasoning items alongside tool calls and results.
 - **Compatibility is limited to the endpoints above.** Embeddings are not supported, and not every OpenAI parameter is accepted. Supported options can vary by model. Chat Completions is limited to text and `function` tools; use Responses for features such as image input or other tool types where Codex supports them.
-- **The upstream is ChatGPT Codex, not `api.openai.com`.** The backend may change independently of the public OpenAI API.
+- **The upstream is ChatGPT Codex, not `api.openai.com`.** The backend may change independently of the public OpenAI API. It does not accept `safety_identifier`, so the gateway omits it, including when derived from Chat Completions `user`.
 
-Leading `system` messages are sent to Codex as one leading `developer` message so their text can be part of the cached prefix. An explicit Responses `instructions` field is forwarded separately.
+Leading `system` messages are sent to Codex as one leading `developer` message so their text can be part of the cached prefix. An explicit Responses `instructions` field is forwarded separately. Tool call IDs over Codex's 64-character limit are shortened consistently for calls and their matching results before forwarding.
+
+Chat Completions accepts `reasoning` as a Responses-style object (`{"effort":"high"}`)
+or as an effort string (`"high"`). An explicit effort in `reasoning` takes
+precedence over `reasoning_effort`. Boolean `true` supplies `medium` only if no
+explicit effort is given; `false` supplies no effort override and does not
+disable reasoning on models that require it.
 
 ### Testing a Chat Completions tool call
 
@@ -201,7 +207,32 @@ curl -fsS http://127.0.0.1:8787/v1/chat/completions \
 
 Replace `MODEL_ID` with an `id` from `/v1/models`. The client receives `message.tool_calls`, runs the function, and sends the history back with the `assistant` message followed by a `tool` message whose `tool_call_id` matches the call's `id`. The gateway does not run the function. Legacy Chat `function_call` calls and `custom` tools are not supported on this endpoint.
 
-If a remote client uses `stream: true` (like Cursor Agent), the tunnel must support SSE. Quick Tunnels at `trycloudflare.com` do not support SSE.
+### Troubleshooting Cursor through Cloudflare Tunnel
+
+- Set Cursor's override base URL to `https://<your-hostname>/v1` and use your
+  `CODEX_API_KEY` as the API key. Keep the gateway bound to loopback and use a
+  strong, dedicated key if you expose it through a tunnel.
+- With the default gateway listener, set the hostname's ingress `service` to
+  `http://127.0.0.1:8787` (without `/v1`). `localhost` can resolve to `::1`,
+  where the default IPv4 listener is not reachable. Run
+  `cloudflared tunnel ingress validate` and restart the tunnel after editing
+  its configuration. A request to `/v1/models` without a key should return
+  `401` with `invalid_api_key` if it reached the gateway.
+- A `400` with `messages[N]: unsupported message field` comes from the gateway's
+  Chat Completions parser, not the tunnel. `N` is the zero-based message index;
+  the error names the field, not its value. Extra message fields set to `null`
+  are ignored. Chat participant names (`name`) and Cursor's
+  `modelProviderMessageId` are accepted as strings but not forwarded because
+  Responses messages have no corresponding fields.
+- If Cursor sends non-function tools and the gateway rejects them, set
+  `CODEX_CHAT_FUNCTION_TOOLS_ONLY=1` and restart the gateway. For Homebrew,
+  set it in `~/.config/codex_ai/env`. This removes non-function tools from
+  Chat Completions requests before forwarding while keeping regular function
+  tools. If no tools remain, generation continues without tools. Requests to
+  `/v1/responses` are unaffected. The gateway cannot change what Cursor enables
+  or fix a request that Cursor blocks before sending it.
+- If a remote client uses `stream: true` (like Cursor Agent), the tunnel must
+  support SSE. Quick Tunnels at `trycloudflare.com` do not support SSE.
 
 ## Request logs
 
@@ -217,7 +248,7 @@ codex_ai serve --logs debug
 
 If you export `CODEX_API_KEY` yourself, you can run the Homebrew binary directly with `codex-ai serve --logs info` (or `debug`). From a Cargo checkout, use `cargo run --locked -- serve --logs info` (or `debug`).
 
-`info` logs one line per HTTP response with the method, route, status, and elapsed time. `debug` adds request start, recognized GPT model, tool count, OAuth cache status, and Codex stream diagnostics. Logs go to `stderr`, and events for the same request share a `request` ID. In SSE mode, `http.response` marks when headers are sent, not when generation finishes. In `debug` mode, look for `codex.stream.end` or `codex.stream.error` afterward.
+`info` logs one line per HTTP response with the method, route, status, and elapsed time. `debug` adds request start, recognized GPT model, tool count, OAuth cache status, and Codex stream diagnostics. For a Chat Completions request rejected before forwarding, look for `chat.validation_rejected` for the validation reason. Logs go to `stderr`, and events for the same request share a `request` ID. In SSE mode, `http.response` marks when headers are sent, not when generation finishes. In `debug` mode, look for `codex.stream.end` or `codex.stream.error` afterward.
 
 Request logging is off unless you pass `--logs` or set `CODEX_DEBUG=1`. An explicit `--logs` overrides that variable. If you use `brew services`, add `CODEX_DEBUG=1` to the [service environment file](#manage-the-homebrew-service) and restart the service.
 
@@ -231,7 +262,14 @@ No telemetry is sent externally. Request logs do not include full URLs, headers,
 - `CODEX_LISTEN` lets you change the port or loopback address (for example, `127.0.0.1:8080`). Do not expose the server to the network: anyone with the local key can use your account's quota.
 - To clear the local cache, stop the server and run `codex-ai-service logout` (Homebrew) or `cargo run --locked -- logout` (Cargo). This does not revoke the session with OpenAI.
 
-`cargo test --locked` checks the cache and HTTP formats against a mock backend. No ChatGPT account is required.
+## Code layout
+
+The Cargo package builds two crates. The library (`src/lib.rs`) translates Chat
+Completions and normalizes Responses requests without making network calls. The
+binary (`src/main.rs`) handles the CLI, HTTP, and OAuth. Its SSE transport lives in
+`src/api/stream.rs`. Both are packaged and released together as `codex_ai`.
+
+`cargo test --locked` runs the protocol, cache, and HTTP tests. The HTTP tests use a mock backend, so no ChatGPT account is required.
 
 ## Homebrew maintenance
 
