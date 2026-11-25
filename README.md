@@ -33,6 +33,9 @@ brew test bbrangeo/codex-ai/codex-ai
 `~/.config/codex_ai/env` with `0600` permissions. Generate a local key with
 `openssl rand -hex 32` and set `CODEX_API_KEY` in that file. You can also set
 `CODEX_LISTEN` (default: `127.0.0.1:8787`) or `CODEX_DEBUG=1`.
+New files include `CODEX_CHAT_FUNCTION_TOOLS_ONLY=1` by default for
+[Chat Completions compatibility with Cursor](#troubleshooting-cursor-through-cloudflare-tunnel).
+Set it to `0` if you do not want the gateway to filter tools.
 
 **Set the key in this file, not just in your terminal.** On macOS, `brew services`
 starts the gateway through `launchd`, so it does not inherit an
@@ -236,11 +239,13 @@ Replace `MODEL_ID` with an `id` from `/v1/models`. The client receives `message.
   are ignored. Chat participant names (`name`) and Cursor's
   `modelProviderMessageId` are accepted as strings but not forwarded because
   Responses messages have no corresponding fields.
-- If Cursor sends non-function tools and the gateway rejects them, set
-  `CODEX_CHAT_FUNCTION_TOOLS_ONLY=1` and restart the gateway. For Homebrew,
-  set it in `~/.config/codex_ai/env`. This removes non-function tools from
-  Chat Completions requests before forwarding while keeping regular function
-  tools. If no tools remain, generation continues without tools. Requests to
+- If Cursor sends non-function tools and the gateway rejects them, check for
+  `CODEX_CHAT_FUNCTION_TOOLS_ONLY=1`. New Homebrew configurations include it by
+  default. For an existing configuration, add it to `~/.config/codex_ai/env`
+  and [restart the service](#manage-the-homebrew-service). If you launch the
+  binary directly, export the variable before starting it. The gateway drops
+  non-function tools from Chat Completions requests and keeps function tools.
+  If no tools remain, generation continues without tools. Requests to
   `/v1/responses` are unaffected. The gateway cannot change what Cursor enables
   or fix a request that Cursor blocks before sending it.
 - If a remote client uses `stream: true` (like Cursor Agent), the tunnel must
