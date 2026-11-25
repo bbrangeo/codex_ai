@@ -188,6 +188,12 @@ the error with that header instead. It never restarts an SSE stream.
 
 Leading `system` messages are sent to Codex as one leading `developer` message so their text can be part of the cached prefix. An explicit Responses `instructions` field is forwarded separately. Tool call IDs over Codex's 64-character limit are shortened consistently for calls and their matching results before forwarding.
 
+For Chat Completions, the gateway fills in a missing or empty `prompt_cache_key`
+from the model and the first normalized `developer` and `user` messages. Later
+turns reuse the key as long as those inputs stay the same. The gateway forwards
+it as both `session-id` and `thread-id`. Set an explicit key if your client
+trims the beginning of the conversation or needs to distinguish identical starts.
+
 Both generation endpoints return `400` for a `reasoning.effort` or `service_tier`
 that the model catalog does not support. Use `priority` for Fast and `ultrafast`
 for Ultrafast. If no effort is specified, the gateway uses the model's catalog

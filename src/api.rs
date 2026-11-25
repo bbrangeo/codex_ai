@@ -19,6 +19,7 @@ use codex_ai::chat::{self, ChatStream};
 use codex_ai::responses::normalize_request;
 use reqwest::{Client, RequestBuilder};
 use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq as _;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
@@ -346,6 +347,7 @@ async fn chat_completions(
         ));
     })?;
     normalize_request(&mut body)?;
+    set_chat_cache_key(&mut body);
     let upstream = codex
         .start_response(&mut body, options.stream(), fallback_effort, trace)
         .await?;
@@ -359,6 +361,28 @@ async fn chat_completions(
         let response = collect_response(upstream, trace).await?;
         Ok(Json(chat::completion(&response, options.model())).into_response())
     }
+}
+
+fn set_chat_cache_key(body: &mut Value) {
+    let key = &body["prompt_cache_key"];
+    if !key.is_null() && key != "" {
+        return;
+    }
+    let Some(input) = body["input"].as_array() else {
+        return;
+    };
+    let first_content = |role: &str| {
+        input
+            .iter()
+            .find(|message| message["role"] == role)
+            .map(|message| &message["content"])
+    };
+    let prefix = json!([
+        &body["model"],
+        first_content("developer"),
+        first_content("user")
+    ]);
+    body["prompt_cache_key"] = json!(format!("{:x}", Sha256::digest(prefix.to_string())));
 }
 
 fn filter_chat_tools(body: &mut Value, trace: Trace) {

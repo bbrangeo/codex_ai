@@ -330,6 +330,15 @@ async fn serves_openai_formats_with_local_auth_and_codex_upstream() -> Result<()
         .route("/responses", post(move |headers: HeaderMap, Json(body): Json<Value>| async move {
             calls.fetch_add(1, Ordering::Relaxed);
             assert_eq!(headers[header::AUTHORIZATION], "Bearer test-upstream-token");
+            if body["metadata"]["api"] == "responses" {
+                assert!(body.get("prompt_cache_key").is_none());
+                assert!(!headers.contains_key("session-id"));
+                assert!(!headers.contains_key("thread-id"));
+            } else {
+                let key = body["prompt_cache_key"].as_str().expect("Chat needs a cache key");
+                assert_eq!(headers["session-id"], key);
+                assert_eq!(headers["thread-id"], key);
+            }
             if body["model"] == "mock-model" {
                 if body["service_tier"] == "priority" {
                     assert_eq!(body["reasoning"]["effort"], "high");
@@ -394,7 +403,7 @@ async fn serves_openai_formats_with_local_auth_and_codex_upstream() -> Result<()
     let request = |stream| {
         client.post(&url).bearer_auth(KEY).json(&json!({
             "model": "mock-model", "input": "Hello", "stream": stream,
-            "safety_identifier": "test-user"
+            "safety_identifier": "test-user", "metadata": {"api": "responses"}
         }))
     };
     let response: Value = request(false)
@@ -552,6 +561,50 @@ async fn serves_openai_formats_with_local_auth_and_codex_upstream() -> Result<()
     assert_eq!(catalog_reads.load(Ordering::Relaxed), 1);
     local_task.abort();
     upstream_task.abort();
+    Ok(())
+}
+
+#[test]
+fn chat_cache_key_tracks_only_the_model_and_first_developer_and_user_messages() -> Result<()> {
+    let original = json!({"model": "mock-model", "messages": [
+        {"role": "system", "content": "Instructions"},
+        {"role": "user", "content": "First question"}
+    ]});
+    let key_for = |request| -> Result<Value> {
+        let (mut body, _) = chat::into_responses(request)?;
+        normalize_request(&mut body)?;
+        set_chat_cache_key(&mut body);
+        Ok(body["prompt_cache_key"].take())
+    };
+    let key = key_for(original.clone())?;
+    assert_eq!(key.as_str().map(str::len), Some(64));
+
+    let mut follow_up = original.clone();
+    follow_up["messages"][0]["role"] = json!("developer");
+    follow_up["messages"] = json!([
+        follow_up["messages"][0], follow_up["messages"][1],
+        {"role": "assistant", "content": "Answer"},
+        {"role": "developer", "content": "Updated instructions"},
+        {"role": "user", "content": "Follow-up question"}
+    ]);
+    assert_eq!(key_for(follow_up)?, key);
+
+    let mut changed = original.clone();
+    changed["model"] = json!("other-model");
+    assert_ne!(key_for(changed)?, key);
+    for index in [0, 1] {
+        let mut changed = original.clone();
+        changed["messages"][index]["content"] = json!("Changed");
+        assert_ne!(key_for(changed)?, key);
+    }
+
+    let mut explicit = original;
+    for absent in [Value::Null, json!("")] {
+        explicit["prompt_cache_key"] = absent;
+        assert_eq!(key_for(explicit.clone())?, key);
+    }
+    explicit["prompt_cache_key"] = json!("client-key");
+    assert_eq!(key_for(explicit)?, "client-key");
     Ok(())
 }
 
