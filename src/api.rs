@@ -16,7 +16,7 @@ use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use codex_ai::InvalidRequest;
 use codex_ai::chat::{self, ChatStream};
-use codex_ai::responses::normalize_request;
+use codex_ai::responses::{normalize_compact_request, normalize_request};
 use reqwest::{Client, RequestBuilder};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
@@ -143,12 +143,23 @@ impl Codex {
             model_for_debug(&body["model"]),
             body["tools"].as_array().map_or(0, Vec::len)
         ));
-        let url = format!("{}/responses", self.base_url);
+        self.post_responses("responses", "text/event-stream", body, trace)
+            .await
+    }
+
+    async fn post_responses(
+        &self,
+        path: &str,
+        accept: &str,
+        body: &Value,
+        trace: Trace,
+    ) -> Result<UpstreamResponse, ApiError> {
+        let url = format!("{}/{path}", self.base_url);
         self.send(trace, || {
             let mut request = self
                 .client
                 .post(&url)
-                .header(header::ACCEPT, "text/event-stream")
+                .header(header::ACCEPT, accept)
                 .json(body);
             if let Some(key) = body["prompt_cache_key"].as_str()
                 && !key.is_empty()
@@ -233,6 +244,7 @@ pub(super) fn router(
     Router::new()
         .route("/v1/models", get(models))
         .route("/v1/responses", post(responses))
+        .route("/v1/responses/compact", post(compact_responses))
         .route(
             "/v1/chat/completions",
             post(chat_completions).layer(Extension(chat_tools)),
@@ -323,6 +335,28 @@ async fn responses(
     } else {
         Ok(Json(collect_response(upstream, trace).await?).into_response())
     }
+}
+
+async fn compact_responses(
+    State(codex): State<Arc<Codex>>,
+    Extension(trace): Extension<Trace>,
+    body: Result<Json<Value>, JsonRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let mut body = body?.0;
+    normalize_compact_request(&mut body)?;
+    let UpstreamResponse {
+        response,
+        permit: _permit,
+    } = codex
+        .post_responses("responses/compact", "application/json", &body, trace)
+        .await?;
+    let compacted: Value = response.json().await?;
+    if !compacted["output"].is_array() {
+        return Err(ApiError::gateway(
+            "Codex compaction response is missing an output array",
+        ));
+    }
+    Ok(Json(compacted))
 }
 
 async fn chat_completions(

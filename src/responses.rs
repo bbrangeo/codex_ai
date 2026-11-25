@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
 
 use crate::InvalidRequest;
@@ -16,6 +16,31 @@ const MAX_CALL_ID_LEN: usize = 64;
 /// # Errors
 /// Returns an error for malformed input, unsupported server-side state, or colliding call IDs.
 pub fn normalize_request(body: &mut Value) -> Result<bool, InvalidRequest> {
+    let (body, stream) = normalize_stateless_request(body)?;
+    body.insert("store".into(), Value::Bool(false));
+    body.insert("stream".into(), Value::Bool(true));
+    Ok(stream)
+}
+
+/// Normalizes the history for native, non-streaming Codex compaction.
+///
+/// # Errors
+/// Returns an error for malformed input, server-side state, or requested streaming.
+pub fn normalize_compact_request(body: &mut Value) -> Result<(), InvalidRequest> {
+    let (body, stream) = normalize_stateless_request(body)?;
+    if stream {
+        return Err(InvalidRequest(
+            "compaction does not support streaming".into(),
+        ));
+    }
+    body.remove("store");
+    body.remove("stream");
+    Ok(())
+}
+
+fn normalize_stateless_request(
+    body: &mut Value,
+) -> Result<(&mut Map<String, Value>, bool), InvalidRequest> {
     let body = body
         .as_object_mut()
         .ok_or_else(|| InvalidRequest("expected a JSON object".into()))?;
@@ -63,9 +88,7 @@ pub fn normalize_request(body: &mut Value) -> Result<bool, InvalidRequest> {
     body.remove("background");
     // Unlike the public Responses API, the Codex backend rejects this field.
     body.remove("safety_identifier");
-    body.insert("store".into(), Value::Bool(false));
-    body.insert("stream".into(), Value::Bool(true));
-    Ok(stream)
+    Ok((body, stream))
 }
 
 fn normalize_call_ids(input: &mut [Value]) -> Result<(), InvalidRequest> {

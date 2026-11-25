@@ -153,7 +153,13 @@ curl -fsS http://127.0.0.1:8787/v1/chat/completions \
 | --- | --- |
 | `GET /v1/models` | Lists models visible in your Codex account's catalog, or a built-in fallback list if no catalog could be loaded. |
 | `POST /v1/responses` | Generates responses as JSON or SSE (`stream: true`). Native Responses items and tools are forwarded to Codex, subject to backend support. |
+| `POST /v1/responses/compact` | Compacts the supplied history with Codex. Returns JSON only. |
 | `POST /v1/chat/completions` | Returns text, `function` tool calls, and usage as JSON or SSE. For images and other tool types, use Responses. |
+
+To compact a conversation, send `model` and the current history as `input` to
+`/v1/responses/compact`. Use the returned `output` as the new history for
+`/v1/responses`, then append new items. Keep any opaque `compaction` items intact.
+The gateway does not compact automatically or support `previous_response_id`.
 
 ## How it works
 

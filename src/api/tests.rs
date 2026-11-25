@@ -138,6 +138,114 @@ async fn retries_before_streaming_and_keeps_the_slot_until_the_stream_ends() -> 
 }
 
 #[tokio::test]
+async fn compacts_responses_with_the_native_codex_endpoint() -> Result<()> {
+    const KEY: &str = "only-for-the-local-mocked-api-test";
+    let prior = json!({"type": "compaction", "encrypted_content": "prior-opaque"});
+    let user = json!({"type": "message", "role": "user", "content": [
+        {"type": "input_text", "text": "Continue"}
+    ]});
+    let compacted = json!({
+        "id": "resp_compacted", "object": "response.compaction", "created_at": 1,
+        "output": [user, {"type": "compaction", "id": "cmp_test", "encrypted_content": "new-opaque"}],
+        "usage": {"input_tokens": 1000, "output_tokens": 100, "total_tokens": 1100}
+    });
+    let upstream_output = compacted.clone();
+    let expected = json!({
+        "model": "mock-model", "instructions": "Keep decisions", "prompt_cache_key": "test-session",
+        "input": [prior, user]
+    });
+    let mock = Router::new().route(
+        "/responses/compact",
+        post(
+            move |headers: HeaderMap, Json(body): Json<Value>| async move {
+                assert_eq!(headers[header::AUTHORIZATION], "Bearer test-upstream-token");
+                assert_eq!(headers["chatgpt-account-id"], "test-account");
+                assert_eq!(headers[header::ACCEPT], "application/json");
+                if body["model"] == "mock-invalid-output" {
+                    return Json(json!({"output": null}));
+                }
+                assert_eq!(headers["session-id"], "test-session");
+                assert_eq!(headers["thread-id"], "test-session");
+                assert_eq!(body, expected);
+                Json(upstream_output)
+            },
+        ),
+    );
+    let (upstream, upstream_task) = start(mock).await?;
+    let directory = tempfile::tempdir()?;
+    let client = Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    let session = crate::auth::test_session(directory.path().join("private"), client.clone())?;
+    let mut codex = Codex::new(client.clone(), session, 1);
+    codex.base_url = upstream;
+    let (local, local_task) = start(router(
+        codex,
+        local_key(KEY)?,
+        LogLevel::Off,
+        ChatTools::Strict,
+    ))
+    .await?;
+    let url = format!("{local}/v1/responses/compact");
+    let request = json!({
+        "model": "mock-model", "instructions": "Keep decisions", "prompt_cache_key": "test-session",
+        "input": [prior, {"role": "user", "content": "Continue"}], "stream": false, "store": false
+    });
+
+    let rejected = client.post(&url).json(&request).send().await?;
+    assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+    for key in ["previous_response_id", "stream"] {
+        let mut invalid = request.clone();
+        invalid[key] = if key == "stream" {
+            json!(true)
+        } else {
+            json!("resp_old")
+        };
+        let rejected = client
+            .post(&url)
+            .bearer_auth(KEY)
+            .json(&invalid)
+            .send()
+            .await?;
+        assert_eq!(
+            rejected.status(),
+            StatusCode::BAD_REQUEST,
+            "rejected field {key}"
+        );
+        assert_eq!(
+            rejected.json::<Value>().await?["error"]["code"],
+            "invalid_request"
+        );
+    }
+    let response = client
+        .post(&url)
+        .bearer_auth(KEY)
+        .json(&request)
+        .send()
+        .await?
+        .error_for_status()?;
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    assert_eq!(response.json::<Value>().await?, compacted);
+
+    let invalid = client
+        .post(&url)
+        .bearer_auth(KEY)
+        .json(&json!({"model": "mock-invalid-output", "input": "Continue"}))
+        .send()
+        .await?;
+    assert_eq!(invalid.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        invalid.json::<Value>().await?["error"]["code"],
+        "upstream_error"
+    );
+    local_task.abort();
+    upstream_task.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn preserves_provider_error_codes_in_json_and_chat_streams() -> Result<()> {
     let event = json!({"type": "response.failed", "response": {"error": {
         "code": "usage_limit_reached", "message": "Quota exhausted"
