@@ -1,0 +1,17 @@
+{
+  "status": "ok",
+  "message-type": "work-list",
+  "message": {
+    "items": [
+      {
+        "DOI": "10.2345/Building.1",
+        "title": ["Coupled heat and moisture transfer"],
+        "author": [{"given": "Ada", "family": "Lee"}, {"name": "Building Science Group"}],
+        "issued": {"date-parts": [[2022, 4]]},
+        "container-title": ["Building Physics"],
+        "is-referenced-by-count": 0,
+        "URL": "https://doi.org/10.2345/Building.1"
+      }
+    ]
+  }
+}

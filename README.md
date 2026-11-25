@@ -390,6 +390,45 @@ binary (`src/main.rs`) handles the CLI, HTTP, and OAuth. Its SSE transport lives
 
 `cargo test --locked` runs the protocol, cache, and HTTP tests. The HTTP tests use a mock backend, so no ChatGPT account is required.
 
+## Exemple multi-agents bibliographique
+
+[`examples/multi_agent_biblio/`](examples/multi_agent_biblio/) est un projet Cargo autonome
+(Rust 1.97.1+), sans dépendance supplémentaire pour le binaire de la passerelle.
+Il utilise [Rig](https://rig.rs/docs/concepts/) et le protocole `/v1/responses` : le
+manager planifie et arbitre, le chercheur interroge les sources, le rédacteur
+synthétise les abstracts et le critique examine la couverture et vérifie des DOI.
+La sélection est limitée aux notices effectivement retournées par les outils.
+
+Démarrez la passerelle (`cargo run -- login`, puis `cargo run -- serve` à la racine),
+exportez la même `CODEX_API_KEY` et choisissez un ID dans `GET /v1/models` :
+
+```sh
+cargo run --manifest-path examples/multi_agent_biblio/Cargo.toml -- \
+  "îlots de chaleur urbains et indice UTCI" --model MODEL_ID \
+  --max-rounds 2 --max-refs 30 --year-from 2015 \
+  --out biblio.md --bibtex biblio.bib --cache-dir .biblio-cache --dump-json biblio-run
+```
+
+- `CODEX_BASE_URL` vaut par défaut `http://127.0.0.1:8787/v1`. Pour changer le
+  modèle d’un rôle, définissez `BIBLIO_MANAGER_MODEL`, `BIBLIO_RESEARCHER_MODEL`,
+  `BIBLIO_WRITER_MODEL` ou `BIBLIO_CRITIC_MODEL`. Le dialecte Rig pour Codex ne
+  transmet pas `temperature`, que ce backend refuse.
+- OpenAlex, Crossref, HAL et arXiv ne demandent pas de clé. `OPENALEX_MAILTO` ajoute
+  un contact aux requêtes OpenAlex et au `User-Agent` Crossref (surcharge possible
+  via `CROSSREF_MAILTO`). `TAVILY_API_KEY` active la recherche de littérature grise
+  via Tavily. Les requêtes de recherche sont envoyées aux services utilisés ; les
+  notices retenues et leurs résumés sont transmis à Codex.
+- Les recherches traitent deux sous-questions à la fois, avec au plus six appels
+  d’outils par sous-question et passage. Le critique a six appels par tour, dont
+  jusqu’à trois vérifications DOI tirées au sort. ✅ indique un DOI dont Crossref
+  a confirmé le titre normalisé ; ⚠️ indique un DOI non confirmé ou absent.
+- `--cache-dir` réutilise les réponses des fournisseurs. `--dump-json` écrit le
+  plan, les brouillons, critiques, décisions et notices retenues ; `tools/`
+  contient les réponses brutes (Atom XML pour arXiv). Traitez ces répertoires
+  comme des données de recherche, y compris les requêtes dans les logs `stderr`.
+
+Tests sans réseau : `cargo test --manifest-path examples/multi_agent_biblio/Cargo.toml`.
+
 ## Homebrew maintenance
 
 ### Manage the Homebrew service

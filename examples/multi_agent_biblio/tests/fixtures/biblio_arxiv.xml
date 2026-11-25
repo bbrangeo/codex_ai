@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:arxiv="http://arxiv.org/schemas/atom">
+  <title>arXiv Query</title>
+  <entry>
+    <id>http://arxiv.org/abs/2401.01234v2</id>
+    <updated>2025-03-02T10:00:00Z</updated>
+    <published>2024-01-02T10:00:00Z</published>
+    <title>Temperature &amp;
+      humidity in a test cell</title>
+    <summary>We model the envelope.
+      We compare the results.</summary>
+    <author><name>Camille Durand</name></author>
+    <author><name>Ada Lee</name></author>
+    <arxiv:doi>10.5678/Example.ArXiv</arxiv:doi>
+    <arxiv:journal_ref>Journal of Heat Transfer</arxiv:journal_ref>
+    <link href="http://arxiv.org/abs/2401.01234v2" rel="alternate" type="text/html"/>
+  </entry>
+  <entry>
+    <id>http://arxiv.org/abs/2401.01235v1</id>
+    <published>2024-01-03T10:00:00Z</published>
+    <title>Unpublished preprint</title>
+    <author><name>Lou Bernard</name></author>
+  </entry>
+</feed>

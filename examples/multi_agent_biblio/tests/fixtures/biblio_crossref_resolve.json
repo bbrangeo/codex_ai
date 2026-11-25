@@ -1,0 +1,13 @@
+{
+  "status": "ok",
+  "message-type": "work",
+  "message": {
+    "DOI": "10.3456/Meeting.A",
+    "title": ["Sensitivity of a thermal model"],
+    "author": [{"family": "Durand"}],
+    "published": {"date-parts": [[2018]]},
+    "event": {"name": "Thermal Simulation Conference"},
+    "is-referenced-by-count": 7,
+    "abstract": "<jats:p>A sensitivity study.</jats:p>"
+  }
+}

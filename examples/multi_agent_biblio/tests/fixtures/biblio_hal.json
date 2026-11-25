@@ -1,0 +1,16 @@
+{
+  "response": {
+    "docs": [
+      {
+        "title_s": ["Isolation thermique et humidité"],
+        "authFullName_s": ["Camille Durand", "Lou Bernard"],
+        "producedDateY_i": 2023,
+        "conferenceTitle_s": "Journées de thermique",
+        "doiId_s": "10.4567/Example.HAL",
+        "openAccess_bool": true,
+        "abstract_s": ["Étude du transfert de chaleur."],
+        "uri_s": "https://hal.science/hal-01234567"
+      }
+    ]
+  }
+}

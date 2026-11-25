@@ -1,0 +1,22 @@
+{
+  "results": [
+    {
+      "id": "https://openalex.org/W1234567",
+      "doi": "https://doi.org/10.1234/Example.A",
+      "title": "Envelope performance in winter",
+      "authorships": [
+        {"author": {"display_name": "Camille Durand"}},
+        {"author": {"display_name": "Ada Lee"}}
+      ],
+      "publication_year": 2021,
+      "primary_location": {
+        "landing_page_url": "https://example.org/article",
+        "source": {"display_name": "Building Physics"}
+      },
+      "cited_by_count": 11,
+      "open_access": {"is_oa": false},
+      "abstract_inverted_index": {"façade": [3], "the": [2], "We": [0], "study": [1, 4]}
+    },
+    {"id": "https://openalex.org/W1234568", "title": "Earlier study", "publication_year": 2015}
+  ]
+}
