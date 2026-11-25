@@ -30,6 +30,144 @@ pub(super) async fn start(app: Router) -> Result<(String, JoinHandle<std::io::Re
     Ok((url, task))
 }
 
+#[tokio::test]
+async fn provides_public_liveness_and_protects_model_details() -> Result<()> {
+    const KEY: &str = "only-for-the-local-mocked-api-test";
+    let reads = Arc::new(AtomicUsize::new(0));
+    let mock = Router::new().fallback({
+        let reads = Arc::clone(&reads);
+        move |request: Request| async move {
+            reads.fetch_add(1, Ordering::Relaxed);
+            assert_eq!(request.uri().path(), "/models");
+            Json(json!({"models": [
+                {"slug": "mock-model", "visibility": "list", "priority": 1,
+                 "context_window": 128_000, "base_instructions": "private"},
+                {"slug": "gpt-5.6-sol", "visibility": "hide", "priority": 0}
+            ]}))
+        }
+    });
+    let (upstream, upstream_task) = start(mock).await?;
+    let directory = tempfile::tempdir()?;
+    let client = Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    let session = crate::auth::test_session(directory.path().join("private"), client.clone())?;
+    let mut codex = Codex::new(client.clone(), session, 4);
+    codex.base_url = upstream;
+    let (local, local_task) = start(router(
+        codex,
+        local_key(KEY)?,
+        LogLevel::Off,
+        ChatTools::Strict,
+    ))
+    .await?;
+
+    let health = client.get(format!("{local}/healthz")).send().await?;
+    assert_eq!(health.status(), StatusCode::OK);
+    assert_eq!(health.headers()[header::CACHE_CONTROL], "no-store");
+    assert!(health.bytes().await?.is_empty());
+    let models = format!("{local}/v1/models");
+    let detail = format!("{models}/mock-model");
+    for request in [
+        client.get(&detail),
+        client.get(&detail).bearer_auth("wrong-key"),
+    ] {
+        let rejected = request.send().await?;
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(rejected.headers()[header::WWW_AUTHENTICATE], "Bearer");
+    }
+    assert_eq!(reads.load(Ordering::Relaxed), 0);
+
+    let detail: Value = client
+        .get(detail)
+        .bearer_auth(KEY)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let listing: Value = client
+        .get(&models)
+        .bearer_auth(KEY)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(detail, listing["data"][0]);
+    assert_eq!(detail["x_codex"], json!({"context_window": 128_000}));
+    for id in ["gpt-5.6-sol", "unknown-model"] {
+        let response = client
+            .get(format!("{models}/{id}"))
+            .bearer_auth(KEY)
+            .send()
+            .await?;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let error: Value = response.json().await?;
+        assert_eq!(error["error"]["type"], "invalid_request_error");
+        assert_eq!(error["error"]["code"], "model_not_found");
+    }
+    assert_eq!(reads.load(Ordering::Relaxed), 1);
+    local_task.abort();
+    upstream_task.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn serves_fallback_model_details_when_catalog_is_unavailable() -> Result<()> {
+    const KEY: &str = "only-for-the-local-mocked-api-test";
+    let mock = Router::new().route("/models", get(|| async { StatusCode::FORBIDDEN }));
+    let (upstream, upstream_task) = start(mock).await?;
+    let directory = tempfile::tempdir()?;
+    let client = Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    let session = crate::auth::test_session(directory.path().join("private"), client.clone())?;
+    let mut codex = Codex::new(client.clone(), session, 4);
+    codex.base_url = upstream;
+    let (local, local_task) = start(router(
+        codex,
+        local_key(KEY)?,
+        LogLevel::Off,
+        ChatTools::Strict,
+    ))
+    .await?;
+
+    let models = format!("{local}/v1/models");
+    let detail: Value = client
+        .get(format!("{models}/gpt-5.6-sol"))
+        .bearer_auth(KEY)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let listing: Value = client
+        .get(&models)
+        .bearer_auth(KEY)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(detail, listing["data"][0]);
+    assert_eq!(detail["id"], "gpt-5.6-sol");
+    assert_eq!(detail["x_codex"], json!({}));
+    let response = client
+        .get(format!("{models}/unknown-model"))
+        .bearer_auth(KEY)
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let error: Value = response.json().await?;
+    assert_eq!(error["error"]["code"], "model_not_found");
+    local_task.abort();
+    upstream_task.abort();
+    Ok(())
+}
+
 fn with_test_permit(response: reqwest::Response) -> UpstreamResponse {
     let permit = Arc::new(Semaphore::new(1))
         .try_acquire_owned()

@@ -29,6 +29,7 @@ const FALLBACK_MODELS: &[&str] = &[
 
 #[derive(Default)]
 pub(super) struct CachedCatalog {
+    generation: u64,
     latest: Option<Arc<Catalog>>,
     next_refresh_at: Option<Instant>,
     refreshing: Option<watch::Receiver<Option<Arc<Catalog>>>>,
@@ -129,7 +130,18 @@ impl Capabilities {
 
 impl Codex {
     pub(super) async fn model_listing(self: &Arc<Self>, trace: Trace) -> Value {
-        let data: Vec<_> = match self.catalog(trace).await {
+        json!({"object": "list", "data": self.model_entries(trace).await})
+    }
+
+    pub(super) async fn model_entry(self: &Arc<Self>, id: &str, trace: Trace) -> Option<Value> {
+        self.model_entries(trace)
+            .await
+            .into_iter()
+            .find(|entry| entry["id"] == id)
+    }
+
+    async fn model_entries(self: &Arc<Self>, trace: Trace) -> Vec<Value> {
+        match self.catalog(trace).await {
             Some(catalog) => catalog
                 .models
                 .iter()
@@ -144,12 +156,18 @@ impl Codex {
                     .map(|slug| model_entry(slug, &capabilities))
                     .collect()
             }
-        };
-        json!({"object": "list", "data": data})
+        }
     }
 
     async fn catalog(self: &Arc<Self>, trace: Trace) -> Option<Arc<Catalog>> {
         let mut cache = self.catalog.lock().await;
+        let generation = self.session.catalog_generation();
+        if cache.generation != generation {
+            *cache = CachedCatalog {
+                generation,
+                ..CachedCatalog::default()
+            };
+        }
         if cache.next_refresh_at.is_some_and(|at| Instant::now() < at) {
             return cache.latest.clone();
         }
@@ -160,7 +178,7 @@ impl Codex {
                 let (done, refresh) = watch::channel(None);
                 let codex = Arc::clone(self);
                 tokio::spawn(async move {
-                    let latest = codex.refresh_catalog(trace).await;
+                    let latest = codex.refresh_catalog(trace, generation).await;
                     done.send_replace(latest);
                 });
                 refresh
@@ -178,9 +196,13 @@ impl Codex {
         refresh.borrow().clone()
     }
 
-    async fn refresh_catalog(&self, trace: Trace) -> Option<Arc<Catalog>> {
+    async fn refresh_catalog(&self, trace: Trace, generation: u64) -> Option<Arc<Catalog>> {
         let result = timeout(CATALOG_REQUEST_TIMEOUT, self.fetch_catalog(trace)).await;
         let mut cache = self.catalog.lock().await;
+        // A response started under an earlier login must not replace the new catalog.
+        if self.session.catalog_generation() != generation {
+            return None;
+        }
         let delay = match result {
             Ok(Ok(catalog)) => {
                 cache.latest = Some(Arc::new(catalog));

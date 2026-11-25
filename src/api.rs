@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{Context as _, Result, ensure};
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{DefaultBodyLimit, MatchedPath, Request, State};
+use axum::extract::{DefaultBodyLimit, MatchedPath, Path, Request, State};
 use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -48,10 +48,10 @@ struct UpstreamResponse {
 }
 
 impl Codex {
-    pub(super) fn new(client: Client, session: Session, max_concurrency: usize) -> Self {
+    pub(super) fn new(client: Client, session: Arc<Session>, max_concurrency: usize) -> Self {
         Self {
             client,
-            session: Arc::new(session),
+            session,
             base_url: CODEX_BASE_URL.into(),
             catalog: Mutex::default(),
             concurrency: Arc::new(Semaphore::new(max_concurrency)),
@@ -243,6 +243,7 @@ pub(super) fn router(
 ) -> Router {
     Router::new()
         .route("/v1/models", get(models))
+        .route("/v1/models/{id}", get(model))
         .route("/v1/responses", post(responses))
         .route("/v1/responses/compact", post(compact_responses))
         .route(
@@ -250,6 +251,10 @@ pub(super) fn router(
             post(chat_completions).layer(Extension(chat_tools)),
         )
         .route_layer(middleware::from_fn_with_state(key, authorize))
+        .route(
+            "/healthz",
+            get(|| async { (StatusCode::OK, [(header::CACHE_CONTROL, "no-store")]) }),
+        )
         .fallback(|| async { ApiError::new(StatusCode::NOT_FOUND, "not_found", "unknown route") })
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .layer(middleware::from_fn_with_state(log_level, trace_request))
@@ -320,6 +325,24 @@ async fn models(
     Extension(trace): Extension<Trace>,
 ) -> Json<Value> {
     Json(codex.model_listing(trace).await)
+}
+
+async fn model(
+    State(codex): State<Arc<Codex>>,
+    Extension(trace): Extension<Trace>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    codex
+        .model_entry(&id, trace)
+        .await
+        .map(Json)
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                "model_not_found",
+                format!("The model {id:?} does not exist or you do not have access to it."),
+            )
+        })
 }
 
 async fn responses(
@@ -510,7 +533,7 @@ impl ApiError {
             return Self::new(
                 StatusCode::BAD_GATEWAY,
                 "codex_authentication_failed",
-                "Codex rejected the session; stop the server and run `codex_ai login` again",
+                "Codex rejected the session; run `codex_ai login` again",
             );
         }
         let message = format!("Codex returned HTTP {status}");
@@ -611,7 +634,7 @@ impl From<SessionError> for ApiError {
             SessionError::LoginRequired => Self::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "codex_login_required",
-                "stop the server and run `codex_ai login` again",
+                "run `codex_ai login` again",
             ),
             SessionError::Temporary(error) => {
                 eprintln!("Codex session failed: {error:#}");

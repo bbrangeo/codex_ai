@@ -41,13 +41,14 @@ Set it to `0` if you do not want the gateway to filter tools.
 starts the gateway through `launchd`, so it does not inherit an
 `export CODEX_API_KEY=...` from your current shell.
 
-Stop any existing gateway process, then run:
+Sign in:
 
 ```sh
 codex-ai-service login
 ```
 
-Open the displayed URL in a browser **on the same machine** and complete sign-in.
+`login` opens your browser automatically and always prints the sign-in URL.
+For a headless or remote machine, see [Remote sign-in over SSH](#remote-sign-in-over-ssh).
 
 **3. Start the gateway** without `sudo`:
 
@@ -69,7 +70,7 @@ From a checkout of this repository, sign in:
 cargo run --locked -- login
 ```
 
-Open the displayed URL in a browser **on the same machine** and authorize the sign-in. The OAuth callback uses port `1455`, or `1457` if the first port is in use. Then start the server. On macOS and Linux:
+Complete sign-in in the browser, then start the server. On macOS and Linux:
 
 ```sh
 export CODEX_API_KEY="$(openssl rand -hex 32)"
@@ -86,6 +87,52 @@ $rng.Dispose()
 $env:CODEX_API_KEY = [Convert]::ToBase64String($key)
 cargo run --locked -- serve
 ```
+
+## Sign-in and session management
+
+### Remote sign-in over SSH
+
+Use `login --no-browser` to skip opening a browser. The URL is still printed.
+From the machine where your browser runs, connect to the remote host with local
+port forwarding:
+
+```sh
+ssh -L 1455:localhost:1455 user@remote-host
+```
+
+In that SSH session, run `codex_ai login --no-browser` (or
+`codex-ai-service login --no-browser` for Homebrew), then open the printed URL
+in your local browser. Keep the SSH session open until sign-in completes so the
+browser's loopback callback reaches the remote process.
+
+The OAuth callback uses port `1455`, falling back to `1457` if `1455` is busy
+on the remote host. If the sign-in URL specifies callback port `1457`, forward
+it too (add `-L 1457:localhost:1457` to the SSH command), or free port `1455`
+and retry sign-in. The local ports you forward must also be free.
+
+### Reauthenticate without stopping the server
+
+Run `login` again using the same cache and credential store. If the running
+server detects a revoked session or requires sign-in, it reloads the saved
+credentials. On Unix, run `kill -HUP <serve-pid>` after sign-in to have the
+running server adopt the new credentials immediately. `SIGHUP` reloads only
+credentials, not configuration, and does not stop the server.
+
+Only one `serve` process can run per cache. `SIGTERM` and Ctrl-C initiate a
+graceful shutdown, allowing in-flight requests and streams to finish. To clear
+local credentials, **stop the server first** and run `codex-ai-service logout`
+(Homebrew) or `cargo run --locked -- logout` (Cargo) with the same credential
+store settings. `logout` does not revoke the session with OpenAI.
+
+### Check the current session
+
+Run `codex_ai status` or `codex_ai whoami` (with Homebrew, use
+`codex-ai-service status` or `codex-ai-service whoami` so the commands use the
+service's settings). Both are CLI commands that print JSON with the email,
+`account_id`, expiration as a Unix timestamp (seconds), and port. Missing or
+unknown values are `null`; tokens are never printed. The account fields come
+from the saved credentials without contacting Codex. The port is the active
+port if a running server uses the same cache, or the configured port otherwise.
 
 ## Calling the API
 
@@ -151,7 +198,9 @@ curl -fsS http://127.0.0.1:8787/v1/chat/completions \
 
 | Endpoint | Behavior |
 | --- | --- |
+| `GET /healthz` | Returns `200 OK` with no body. Requires no API key and makes no upstream call. This checks liveness, not readiness. |
 | `GET /v1/models` | Lists models visible in your Codex account's catalog, or a built-in fallback list if no catalog could be loaded. |
+| `GET /v1/models/{id}` | Requires the gateway API key. Returns one model from the same catalog or fallback as `GET /v1/models`, or `404` if the ID is not found. |
 | `POST /v1/responses` | Generates responses as JSON or SSE (`stream: true`). Native Responses items and tools are forwarded to Codex, subject to backend support. |
 | `POST /v1/responses/compact` | Compacts the supplied history with Codex. Returns JSON only. |
 | `POST /v1/chat/completions` | Returns text, `function` tool calls, and usage as JSON or SSE. For images and other tool types, use Responses. |
@@ -163,8 +212,9 @@ The gateway does not compact automatically or support `previous_response_id`.
 
 ## How it works
 
-1. **Sign in.** `login` prints a URL for you to open in your browser. The gateway
-   caches the OAuth tokens locally and uses them to authenticate with Codex.
+1. **Sign in.** `login` opens your browser by default and always prints the
+   sign-in URL. The gateway stores the OAuth tokens locally and uses them to
+   authenticate with Codex.
 2. **Connect to localhost.** `serve` listens only on a loopback address. Your
    `CODEX_API_KEY` authenticates your client to the gateway; that key is not sent
    to Codex, and your client does not need access to the OAuth tokens.
@@ -302,9 +352,28 @@ No telemetry is sent externally. Request logs do not include full URLs, headers,
 
 - On macOS and Linux, access and refresh tokens are stored unencrypted in `tokens.json` (`0600`) inside a private cache directory (`0700`). The directory is chosen in this order: `CODEX_CACHE_DIR` (an absolute path), `$XDG_CACHE_HOME/codex_ai`, then `~/.cache/codex_ai`. Do not put the cache directory in a repository or shared folder.
 - On Windows, the unencrypted `tokens.json` file is stored in `%LOCALAPPDATA%\codex_ai` and relies on the inherited permissions of the local user profile. `CODEX_CACHE_DIR` is not supported on Windows. Do not grant other users access to the cache.
-- The server reuses the access token, refreshes it as it nears expiry or after a `401` from Codex, and replaces the cache atomically. Only one process can use the cache at a time. If the session is revoked, stop the server and run `login` again.
+- The server reuses the access token and refreshes it as it nears expiry or after a `401` from Codex. With file storage, it replaces the token file atomically.
 - `CODEX_LISTEN` lets you change the port or loopback address (for example, `127.0.0.1:8080`). Do not expose the server to the network: anyone with the local key can use your account's quota.
-- To clear the local cache, stop the server and run `codex-ai-service logout` (Homebrew) or `cargo run --locked -- logout` (Cargo). This does not revoke the session with OpenAI.
+
+### Optional OS credential storage
+
+File storage is the default. To use the OS credential store, build with
+`cargo build --locked --features keyring` (or use
+`cargo run --locked --features keyring -- <command>` from a checkout) and set
+`CODEX_CREDENTIAL_STORE=keyring` consistently for `login`, `serve`, `status`,
+`whoami`, and `logout`. With a Homebrew build that includes this feature, set
+it in `~/.config/codex_ai/env` so the launcher and service use the same store.
+
+- **macOS:** Uses Keychain.
+- **Windows:** Uses Credential Manager, which limits a credential blob to 2,560 bytes.
+- **Linux:** Uses Secret Service and needs access to an available, unlocked store in the user's session.
+
+There is no automatic fallback to file storage, and enabling `keyring` does
+not import or remove an existing `tokens.json`. If the OS store is unavailable
+or cannot save the credentials, explicitly choose file storage by unsetting
+`CODEX_CREDENTIAL_STORE` for all commands. If you switch manually, sign in
+with the new store selected and keep any existing token file private or delete
+it once you have verified that the new store works.
 
 ## Code layout
 
@@ -328,8 +397,10 @@ brew services stop bbrangeo/codex-ai/codex-ai
 The launcher reads `~/.config/codex_ai/env` at every start without overwriting it.
 Use one assignment per line (`NAME=value` or `NAME='value with spaces'`). The
 file is sourced as shell code: keep it private and only put trusted content in it.
-Stop the service before running `codex-ai-service login` again: the service holds
-the login cache lock.
+You can run `codex-ai-service login` again while the service is running. See
+[session management](#sign-in-and-session-management) for credential reloads
+and check the local session with `codex-ai-service status` or
+`codex-ai-service whoami`.
 
 To watch the service log:
 

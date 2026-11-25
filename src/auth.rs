@@ -1,12 +1,20 @@
 use std::env;
-use std::fs::{self, DirBuilder, File, OpenOptions};
-use std::io::ErrorKind;
+#[cfg(all(
+    feature = "keyring",
+    any(target_os = "macos", target_os = "linux", windows)
+))]
+mod keyring_store;
+
+use std::fs::{self, DirBuilder, File, OpenOptions, TryLockError};
+use std::io::{ErrorKind, Write as _};
+use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt as _;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
@@ -39,17 +47,30 @@ const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
 pub(super) const ORIGINATOR: &str = "codex_ai";
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, PartialEq, Serialize)]
 pub(super) struct Credentials {
     pub(super) access_token: String,
     refresh_token: String,
-    expires_at: u64,
+    pub(super) expires_at: u64,
     pub(super) account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) email: Option<String>,
 }
 
+#[derive(Clone, Copy)]
+enum Store {
+    File,
+    #[cfg(all(
+        feature = "keyring",
+        any(target_os = "macos", target_os = "linux", windows)
+    ))]
+    Keyring,
+}
+
+#[derive(Clone)]
 pub(super) struct Cache {
-    path: PathBuf,
-    _lock: File,
+    directory: PathBuf,
+    store: Store,
 }
 
 impl Cache {
@@ -72,10 +93,31 @@ impl Cache {
             PathBuf::from(env::var_os("LOCALAPPDATA").context("LOCALAPPDATA is not set")?)
                 .join("codex_ai")
         };
-        Self::open_at(directory)
+        let store = match env::var("CODEX_CREDENTIAL_STORE") {
+            Err(env::VarError::NotPresent) => Store::File,
+            Ok(value) if value == "file" => Store::File,
+            Ok(value) if value == "keyring" => {
+                #[cfg(all(
+                    feature = "keyring",
+                    any(target_os = "macos", target_os = "linux", windows)
+                ))]
+                {
+                    Store::Keyring
+                }
+                #[cfg(not(all(
+                    feature = "keyring",
+                    any(target_os = "macos", target_os = "linux", windows)
+                )))]
+                bail!(
+                    "the system credential store is unavailable; a supported build with `--features keyring` is required"
+                );
+            }
+            _ => bail!("CODEX_CREDENTIAL_STORE must be file or keyring"),
+        };
+        Self::open_at(directory, store)
     }
 
-    fn open_at(directory: PathBuf) -> Result<Self> {
+    fn open_at(directory: PathBuf, store: Store) -> Result<Self> {
         ensure!(
             directory.is_absolute(),
             "the cache directory path must be absolute"
@@ -105,22 +147,89 @@ impl Cache {
             "the cache directory must not be a Windows reparse point: {}",
             directory.display()
         );
+        Ok(Self {
+            directory: directory.canonicalize()?,
+            store,
+        })
+    }
+
+    fn lock_file(&self, name: &str) -> Result<File> {
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true).truncate(false);
         #[cfg(unix)]
         options.mode(0o600);
-        let lock = options.open(directory.join("lock"))?;
-        lock.try_lock().context(
-            "cache is locked or inaccessible; stop the other instance before continuing",
-        )?;
-        Ok(Self {
-            path: directory.join("tokens.json"),
-            _lock: lock,
-        })
+        options
+            .open(self.directory.join(name))
+            .context("opening the cache lock")
     }
 
-    fn load(&self) -> Result<Option<Credentials>> {
-        let metadata = match fs::symlink_metadata(&self.path) {
+    pub(super) fn server_lock(&self) -> Result<File> {
+        let lock = self.lock_file("lock")?;
+        lock.try_lock()
+            .context("another server is using this cache; stop it before continuing")?;
+        Ok(lock)
+    }
+
+    fn write_lock(&self) -> Result<File> {
+        let lock = self.lock_file("write.lock")?;
+        lock.lock()
+            .context("locking the OAuth credential store for writing")?;
+        Ok(lock)
+    }
+
+    pub(super) fn record_listener(&self, addr: SocketAddr) -> Result<()> {
+        self.replace_file("listener.addr", addr.to_string().as_bytes())
+            .context("recording the listener address")
+    }
+
+    pub(super) fn clear_listener(&self) -> Result<()> {
+        self.remove_file("listener.addr")
+            .context("clearing the listener address")
+    }
+
+    pub(super) fn listener(&self) -> Result<Option<SocketAddr>> {
+        let lock = self.lock_file("lock")?;
+        match lock.try_lock_shared() {
+            Ok(()) => Ok(None), // No server holds the lock; ignore a stale address after a crash.
+            Err(TryLockError::WouldBlock) => {
+                match fs::read_to_string(self.directory.join("listener.addr")) {
+                    Ok(addr) => Ok(Some(addr.parse().context("invalid listener address")?)),
+                    Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+                    Err(error) => Err(error).context("reading the listener address"),
+                }
+            }
+            Err(TryLockError::Error(error)) => Err(error).context("checking the server lock"),
+        }
+    }
+
+    pub(super) fn load(&self) -> Result<Option<Credentials>> {
+        let bytes = match self.store {
+            Store::File => self.read_file()?,
+            #[cfg(all(
+                feature = "keyring",
+                any(target_os = "macos", target_os = "linux", windows)
+            ))]
+            Store::Keyring => keyring_store::load(&self.directory)?,
+        };
+        let Some(bytes) = bytes else { return Ok(None) };
+        let mut credentials: Credentials = serde_json::from_slice(&bytes)
+            .map_err(|_| anyhow!("OAuth cache is unreadable; run `codex_ai login` again"))?;
+        ensure!(
+            !credentials.access_token.is_empty() && !credentials.refresh_token.is_empty(),
+            "OAuth cache is incomplete; run `codex_ai login` again"
+        );
+        if credentials.email.is_none() {
+            credentials.email = claims(&credentials.access_token)
+                .as_ref()
+                .and_then(email)
+                .map(str::to_owned);
+        }
+        Ok(Some(credentials))
+    }
+
+    fn read_file(&self) -> Result<Option<Vec<u8>>> {
+        let path = self.directory.join("tokens.json");
+        let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error).context("reading the OAuth cache"),
@@ -136,29 +245,58 @@ impl Cache {
             metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
             "the token file must not be a Windows reparse point"
         );
-        let credentials: Credentials = serde_json::from_reader(File::open(&self.path)?)
-            .map_err(|_| anyhow!("OAuth cache is unreadable; run `codex_ai login` again"))?;
-        ensure!(
-            !credentials.access_token.is_empty() && !credentials.refresh_token.is_empty(),
-            "OAuth cache is incomplete; run `codex_ai login` again"
-        );
-        Ok(Some(credentials))
+        match fs::read(path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error).context("reading the OAuth cache"),
+        }
     }
 
     fn save(&self, credentials: &Credentials) -> Result<()> {
-        let directory = self.path.parent().context("missing cache directory")?;
-        let mut file = tempfile::NamedTempFile::new_in(directory)?;
-        serde_json::to_writer(file.as_file_mut(), credentials)?;
+        let bytes = serde_json::to_vec(credentials)?;
+        match self.store {
+            Store::File => self.replace_file("tokens.json", &bytes),
+            #[cfg(all(
+                feature = "keyring",
+                any(target_os = "macos", target_os = "linux", windows)
+            ))]
+            Store::Keyring => keyring_store::save(&self.directory, &bytes),
+        }
+    }
+
+    fn replace_file(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        let mut file = tempfile::NamedTempFile::new_in(&self.directory)?;
+        file.write_all(bytes)?;
         file.as_file().sync_all()?;
-        file.persist(&self.path).map_err(|error| error.error)?;
+        file.persist(self.directory.join(name))
+            .map_err(|error| error.error)?;
         Ok(())
     }
 
-    pub(super) fn remove(&self) -> Result<()> {
-        match fs::remove_file(&self.path) {
+    pub(super) fn logout(&self) -> Result<()> {
+        let _server = self.server_lock()?;
+        let _writer = self.write_lock()?;
+        self.remove_credentials()
+    }
+
+    fn remove_credentials(&self) -> Result<()> {
+        match self.store {
+            Store::File => self
+                .remove_file("tokens.json")
+                .context("removing the OAuth cache"),
+            #[cfg(all(
+                feature = "keyring",
+                any(target_os = "macos", target_os = "linux", windows)
+            ))]
+            Store::Keyring => keyring_store::remove(&self.directory),
+        }
+    }
+
+    fn remove_file(&self, name: &str) -> Result<()> {
+        match fs::remove_file(self.directory.join(name)) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error).context("removing the OAuth cache"),
+            Err(error) => Err(error.into()),
         }
     }
 }
@@ -168,13 +306,29 @@ pub(super) struct Session {
     client: Client,
     token_url: Url,
     state: Arc<Mutex<SessionState>>,
+    catalog_generation: AtomicU64,
 }
 
 struct SessionState {
     credentials: Option<Arc<Credentials>>,
-    dirty: bool,
+    // Keep the last observed on-disk value, even if a save or removal failed.
+    persisted: Option<Arc<Credentials>>,
 }
 
+impl SessionState {
+    fn current(&self) -> Result<Arc<Credentials>, SessionError> {
+        self.credentials.clone().ok_or(SessionError::LoginRequired)
+    }
+
+    fn needs_save(&self, current: &Arc<Credentials>) -> bool {
+        !self
+            .persisted
+            .as_ref()
+            .is_some_and(|saved| Arc::ptr_eq(saved, current))
+    }
+}
+
+#[derive(Debug)]
 pub(super) enum SessionError {
     LoginRequired,
     Temporary(anyhow::Error),
@@ -182,18 +336,53 @@ pub(super) enum SessionError {
 
 impl Session {
     pub(super) fn load(cache: Cache, client: Client) -> Result<Self> {
-        let credentials = cache
-            .load()?
-            .context("no cached session; run `codex_ai login`")?;
+        let credentials = Arc::new(
+            cache
+                .load()?
+                .context("no cached session; run `codex_ai login`")?,
+        );
         Ok(Self {
             cache,
             client,
             token_url: Url::parse(TOKEN_URL)?,
             state: Arc::new(Mutex::new(SessionState {
-                credentials: Some(Arc::new(credentials)),
-                dirty: false,
+                credentials: Some(Arc::clone(&credentials)),
+                persisted: Some(credentials),
             })),
+            catalog_generation: AtomicU64::new(0),
         })
+    }
+
+    #[cfg(any(unix, test))]
+    pub(super) async fn reload(&self) -> Result<()> {
+        let mut state = self.state.lock().await;
+        self.reload_state(&mut state).await
+    }
+
+    pub(super) async fn finish(&self) {
+        // A refresh may still be persisting a rotated token after its HTTP client disconnected.
+        drop(self.state.lock().await);
+    }
+
+    pub(super) fn catalog_generation(&self) -> u64 {
+        self.catalog_generation.load(Ordering::Acquire)
+    }
+
+    async fn reload_state(&self, state: &mut SessionState) -> Result<()> {
+        let cache = self.cache.clone();
+        self.reconcile(
+            state,
+            tokio::task::spawn_blocking(move || cache.load()).await??,
+        );
+        Ok(())
+    }
+
+    fn reconcile(&self, state: &mut SessionState, stored: Option<Credentials>) {
+        if state.persisted.as_deref() != stored.as_ref() {
+            state.persisted = stored.map(Arc::new);
+            state.credentials.clone_from(&state.persisted);
+            self.catalog_generation.fetch_add(1, Ordering::Release);
+        }
     }
 
     pub(super) async fn credentials(
@@ -202,28 +391,23 @@ impl Session {
         trace: Trace,
     ) -> Result<Arc<Credentials>, SessionError> {
         let mut state = Arc::clone(&self.state).lock_owned().await;
-        let current = state
-            .credentials
-            .clone()
-            .ok_or(SessionError::LoginRequired)?;
-        if state.dirty {
-            self.cache.save(&current).map_err(SessionError::Temporary)?;
-            state.dirty = false;
+        if state.credentials.is_none() {
+            self.reload_state(&mut state)
+                .await
+                .map_err(SessionError::Temporary)?;
         }
-        let rejected = rejected.is_some_and(|rejected| Arc::ptr_eq(&current, rejected));
-        if !rejected && current.expires_at > now().saturating_add(REFRESH_MARGIN.as_secs()) {
+        let current = state.current()?;
+        let rejected = rejected.filter(|token| Arc::ptr_eq(token, &current));
+        if rejected.is_none() && !expires_soon(&current) && !state.needs_save(&current) {
             trace.event(format_args!("oauth.cache_hit"));
             return Ok(current);
         }
 
-        trace.event(format_args!(
-            "oauth.refresh.start reason={}",
-            if rejected { "rejected" } else { "expiry" }
-        ));
         // A client disconnect must not interrupt the persistence of a rotated refresh token.
         let session = Arc::clone(self);
+        let rejected = rejected.cloned();
         tokio::spawn(async move {
-            let result = session.refresh(state, trace).await;
+            let result = session.refresh(state, rejected.as_ref(), trace).await;
             trace.event(format_args!("oauth.refresh.end success={}", result.is_ok()));
             result
         })
@@ -231,15 +415,57 @@ impl Session {
         .map_err(|error| SessionError::Temporary(error.into()))?
     }
 
+    async fn persist(
+        &self,
+        state: &mut SessionState,
+        credentials: &Arc<Credentials>,
+    ) -> Result<(), SessionError> {
+        let cache = self.cache.clone();
+        let credentials = Arc::clone(credentials);
+        state.persisted = Some(
+            tokio::task::spawn_blocking(move || {
+                cache
+                    .save(&credentials)
+                    .context("saving refreshed credentials")?;
+                Ok(credentials)
+            })
+            .await
+            .map_err(|error| SessionError::Temporary(error.into()))?
+            .map_err(SessionError::Temporary)?,
+        );
+        Ok(())
+    }
+
     async fn refresh(
         &self,
         mut state: OwnedMutexGuard<SessionState>,
+        rejected: Option<&Arc<Credentials>>,
         trace: Trace,
     ) -> Result<Arc<Credentials>, SessionError> {
-        let current = state
-            .credentials
-            .as_ref()
-            .ok_or(SessionError::LoginRequired)?;
+        // Serialize the whole refresh with login commits. Re-read after taking the
+        // writer lock so a stale refresh can neither overwrite nor delete a new login.
+        let cache = self.cache.clone();
+        let (_writer, stored) = tokio::task::spawn_blocking(move || {
+            let writer = cache.write_lock()?;
+            Ok((writer, cache.load()?))
+        })
+        .await
+        .map_err(|error| SessionError::Temporary(error.into()))?
+        .map_err(SessionError::Temporary)?;
+        self.reconcile(&mut state, stored);
+        let current = state.current()?;
+        if state.needs_save(&current) {
+            self.persist(&mut state, &current).await?;
+        }
+        let rejected = rejected.is_some_and(|token| Arc::ptr_eq(token, &current));
+        if !rejected && !expires_soon(&current) {
+            trace.event(format_args!("oauth.cache_hit"));
+            return Ok(current);
+        }
+        trace.event(format_args!(
+            "oauth.refresh.start reason={}",
+            if rejected { "rejected" } else { "expiry" }
+        ));
         let response = self
             .client
             .post(self.token_url.clone())
@@ -263,23 +489,30 @@ impl Session {
             StatusCode::BAD_REQUEST | StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
         ) {
             state.credentials = None;
-            state.dirty = false;
-            if let Err(error) = self.cache.remove() {
-                eprintln!("Could not remove the OAuth cache: {error:#}");
+            self.catalog_generation.fetch_add(1, Ordering::Release);
+            let cache = self.cache.clone();
+            match tokio::task::spawn_blocking(move || cache.remove_credentials()).await {
+                Ok(Ok(())) => state.persisted = None,
+                _ => eprintln!("Could not remove the revoked OAuth credentials"),
             }
             return Err(SessionError::LoginRequired);
         }
         let fresh = Arc::new(
-            read_tokens(response, Some(current))
+            read_tokens(response, Some(&current))
                 .await
                 .map_err(SessionError::Temporary)?,
         );
+        if fresh.account_id != current.account_id {
+            self.catalog_generation.fetch_add(1, Ordering::Release);
+        }
         state.credentials = Some(Arc::clone(&fresh));
-        state.dirty = true;
-        self.cache.save(&fresh).map_err(SessionError::Temporary)?;
-        state.dirty = false;
+        self.persist(&mut state, &fresh).await?;
         Ok(fresh)
     }
+}
+
+fn expires_soon(credentials: &Credentials) -> bool {
+    credentials.expires_at <= now().saturating_add(REFRESH_MARGIN.as_secs())
 }
 
 #[derive(Deserialize)]
@@ -328,11 +561,22 @@ async fn read_tokens(
         .or_else(|| access_claims.as_ref().and_then(account_id))
         .map(str::to_owned)
         .or_else(|| previous.and_then(|credentials| credentials.account_id.clone()));
+    let email = id_claims
+        .as_ref()
+        .and_then(email)
+        .or_else(|| access_claims.as_ref().and_then(email))
+        .map(str::to_owned)
+        .or_else(|| {
+            previous
+                .filter(|credentials| credentials.account_id == account_id)
+                .and_then(|credentials| credentials.email.clone())
+        });
     Ok(Credentials {
         access_token: tokens.access_token,
         refresh_token,
         expires_at,
         account_id,
+        email,
     })
 }
 
@@ -350,6 +594,16 @@ fn account_id(claims: &Value) -> Option<&str> {
     .into_iter()
     .filter_map(Value::as_str)
     .find(|id| !id.is_empty())
+}
+
+fn email(claims: &Value) -> Option<&str> {
+    [
+        &claims["email"],
+        &claims["https://api.openai.com/profile"]["email"],
+    ]
+    .into_iter()
+    .filter_map(Value::as_str)
+    .find(|email| !email.is_empty())
 }
 
 fn now() -> u64 {
@@ -414,7 +668,7 @@ async fn callback(
     (result.0, [(header::CACHE_CONTROL, "no-store")], result.1)
 }
 
-pub(super) async fn login(cache: &Cache, client: &Client) -> Result<()> {
+pub(super) async fn login(cache: Cache, client: &Client, no_browser: bool) -> Result<()> {
     // The registered Codex OAuth client only accepts specific loopback redirects.
     let listener = match TcpListener::bind(("127.0.0.1", 1455)).await {
         Err(error) if error.kind() == ErrorKind::AddrInUse => {
@@ -450,7 +704,17 @@ pub(super) async fn login(cache: &Cache, client: &Client) -> Result<()> {
             state: state.into(),
             code,
         });
-    println!("Open this URL on the same machine to sign in:\n{url}");
+    println!("If the browser does not open, use this URL to sign in:\n{url}");
+    if !no_browser {
+        let browser = std::thread::Builder::new().spawn(move || {
+            if open::that(url.as_str()).is_err() {
+                eprintln!("Could not open the browser; use the URL above.");
+            }
+        });
+        if browser.is_err() {
+            eprintln!("Could not launch the browser helper; use the URL above.");
+        }
+    }
     let code = tokio::select! {
         result = time::timeout(LOGIN_TIMEOUT, received.recv()) => {
             result.context("OAuth sign-in timed out")?
@@ -476,7 +740,11 @@ pub(super) async fn login(cache: &Cache, client: &Client) -> Result<()> {
         .await
         .context("exchanging the OAuth authorization code")?;
     let credentials = read_tokens(response, None).await?;
-    cache.save(&credentials).context("writing the OAuth cache")
+    tokio::task::spawn_blocking(move || {
+        let _writer = cache.write_lock()?;
+        cache.save(&credentials).context("writing the OAuth cache")
+    })
+    .await?
 }
 
 fn random_urlsafe() -> Result<String> {
@@ -487,15 +755,16 @@ fn random_urlsafe() -> Result<String> {
 }
 
 #[cfg(test)]
-pub(super) fn test_session(directory: PathBuf, client: Client) -> Result<Session> {
-    let cache = Cache::open_at(directory)?;
+pub(super) fn test_session(directory: PathBuf, client: Client) -> Result<Arc<Session>> {
+    let cache = Cache::open_at(directory, Store::File)?;
     cache.save(&Credentials {
         access_token: "test-upstream-token".into(),
         refresh_token: "test-refresh-token".into(),
         expires_at: now() + 3600,
         account_id: Some("test-account".into()),
+        email: None,
     })?;
-    Session::load(cache, client)
+    Session::load(cache, client).map(Arc::new)
 }
 
 #[cfg(test)]
@@ -504,7 +773,8 @@ mod tests {
     use axum::Json;
     use axum::routing::post;
     use serde_json::json;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
+    use tokio::sync::Notify;
 
     #[tokio::test]
     async fn callback_requires_matching_state() -> Result<()> {
@@ -540,19 +810,144 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn loads_a_new_login_after_revocation() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let client = Client::builder().no_proxy().build()?;
+        let mut session = test_session(directory.path().join("private"), client)?;
+        let started = Arc::new(Notify::new());
+        let respond = Arc::new(Notify::new());
+        let mock = Router::new().route(
+            "/token",
+            post({
+                let started = Arc::clone(&started);
+                let respond = Arc::clone(&respond);
+                move || async move {
+                    started.notify_one();
+                    respond.notified().await;
+                    StatusCode::UNAUTHORIZED
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        Arc::get_mut(&mut session)
+            .context("unique test session")?
+            .token_url = Url::parse(&format!("http://{}/token", listener.local_addr()?))?;
+        let server = tokio::spawn(async move { axum::serve(listener, mock).await });
+        let prior = session
+            .credentials(None, Trace::default())
+            .await
+            .ok()
+            .context("existing login")?;
+        let refresh = tokio::spawn({
+            let session = Arc::clone(&session);
+            async move { session.credentials(Some(&prior), Trace::default()).await }
+        });
+        time::timeout(Duration::from_secs(2), started.notified()).await?;
+        let other_writer = session.cache.lock_file("write.lock")?;
+        assert!(matches!(
+            other_writer.try_lock(),
+            Err(TryLockError::WouldBlock)
+        ));
+        respond.notify_one();
+        assert!(matches!(refresh.await?, Err(SessionError::LoginRequired)));
+        server.abort();
+        assert!(session.cache.load()?.is_none());
+        assert!(matches!(
+            session.credentials(None, Trace::default()).await,
+            Err(SessionError::LoginRequired)
+        ));
+
+        {
+            let _writer = session.cache.write_lock()?;
+            session.cache.save(&Credentials {
+                access_token: "new-login".into(),
+                refresh_token: "new-refresh".into(),
+                expires_at: now() + 3600,
+                account_id: Some("new-account".into()),
+                email: None,
+            })?;
+        }
+        let current = session
+            .credentials(None, Trace::default())
+            .await
+            .ok()
+            .context("hot login")?;
+        assert_eq!(current.access_token, "new-login");
+
+        {
+            let _writer = session.cache.write_lock()?;
+            session.cache.save(&Credentials {
+                access_token: "latest-login".into(),
+                refresh_token: "latest-refresh".into(),
+                expires_at: now() + 3600,
+                account_id: None,
+                email: None,
+            })?;
+        }
+        let latest = session
+            .credentials(Some(&current), Trace::default())
+            .await
+            .ok()
+            .context("adopt the saved login instead of refreshing a rejected old token")?;
+        assert_eq!(latest.access_token, "latest-login");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reload_changes_existing_session_without_refreshing_it() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let session = test_session(directory.path().join("private"), Client::new())?;
+        let before = session
+            .credentials(None, Trace::default())
+            .await
+            .ok()
+            .context("existing login")?;
+        let initial_generation = session.catalog_generation();
+        session.reload().await?;
+        assert_eq!(session.catalog_generation(), initial_generation);
+        {
+            let _writer = session.cache.write_lock()?;
+            session.cache.save(&Credentials {
+                access_token: "other-login".into(),
+                refresh_token: "other-refresh".into(),
+                expires_at: now() + 3600,
+                account_id: Some("other-account".into()),
+                email: Some("other@example.test".into()),
+            })?;
+        }
+        session.reload().await?;
+        let current = session
+            .credentials(None, Trace::default())
+            .await
+            .ok()
+            .context("replacement login")?;
+        assert!(!Arc::ptr_eq(&current, &before));
+        assert_eq!(current.email.as_deref(), Some("other@example.test"));
+        assert_ne!(session.catalog_generation(), initial_generation);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn refresh_is_shared_and_persists_rotated_credentials() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("private");
-        let cache = Cache::open_at(path.clone())?;
+        let cache = Cache::open_at(path.clone(), Store::File)?;
+        let _instance = cache.server_lock()?;
+        let second = Cache::open_at(path, Store::File)?;
         assert!(
-            Cache::open_at(path).is_err(),
-            "second session must not acquire the cache"
+            second.server_lock().is_err(),
+            "a second server must not acquire the lock"
+        );
+        assert!(
+            second.write_lock().is_ok(),
+            "a login must be allowed while serving"
         );
         cache.save(&Credentials {
             access_token: "expired".into(),
             refresh_token: "original".into(),
             expires_at: 0,
             account_id: Some("account".into()),
+            email: Some("account@example.test".into()),
         })?;
         let mut session = Session::load(cache, Client::new())?;
         let calls = Arc::new(AtomicUsize::new(0));
@@ -577,9 +972,13 @@ mod tests {
         let cached = session.cache.load()?.context("fresh credentials on disk")?;
         assert_eq!(cached.refresh_token, "rotated");
         assert_eq!(cached.account_id.as_deref(), Some("account"));
+        assert_eq!(cached.email.as_deref(), Some("account@example.test"));
         #[cfg(unix)]
         assert_eq!(
-            fs::metadata(&session.cache.path)?.permissions().mode() & 0o777,
+            fs::metadata(session.cache.directory.join("tokens.json"))?
+                .permissions()
+                .mode()
+                & 0o777,
             0o600
         );
         Ok(())
